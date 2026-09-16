@@ -1,0 +1,22 @@
+# ---- 凭据：严禁入库 ----
+.env
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 运行产物 ----
+*.log
+test_run*.log
+
+# ---- 数据资产（排除于 Git 外）----
+data/manuals/*
+data/sample_inputs/*
+!data/manuals/.gitkeep
+!data/sample_inputs/.gitkeep
