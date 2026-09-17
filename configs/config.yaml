@@ -1,0 +1,9 @@
+# configs/config.yaml 片段
+llm:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4.1flash"  # 您指定的 DeepSeek 新模型标识
+  api_key: "${DEEPSEEK_API_KEY}"
+  timeout: 45.0
+  max_retries: 3
+  temperature: 0.1             # 工业排查场景建议低温以保持确定性
