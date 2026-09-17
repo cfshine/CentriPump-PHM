@@ -1,7 +1,10 @@
-# Python
+# ---- Python ----
 __pycache__/
 *.py[cod]
-*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environment
 .venv/
@@ -24,9 +27,16 @@ dist/
 .coverage
 htmlcov/
 
-# Logs
+# ---- 运行产物 ----
 *.log
+test_run*.log
 
 # OS
 .DS_Store
 Thumbs.db
+
+# ---- 数据资产（排除于 Git 外）----
+data/manuals/*
+data/sample_inputs/*
+!data/manuals/.gitkeep
+!data/sample_inputs/.gitkeep

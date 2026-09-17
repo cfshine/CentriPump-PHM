@@ -1,9 +1,22 @@
-# configs/config.yaml 片段
+# CentriPump-PHM 基础设施配置（模型版本、超时、并发数）
+# 支持 ${ENV} 动态注入，密钥一律走 .env / 环境变量，不落此文件。
+#
+# 说明：Step 2 的模型参数目前仍在 src/utils/llm_client.py 中（temperature=0、
+#       max_tokens=4096），后续统一收敛到本文件。
+app:
+  name: CentriPump-PHM
+  env: ${APP_ENV:-dev}
+
 llm:
-  provider: "deepseek"
-  base_url: "https://api.deepseek.com"
-  model: "deepseek-v4.1flash"  # 您指定的 DeepSeek 新模型标识
-  api_key: "${DEEPSEEK_API_KEY}"
-  timeout: 45.0
-  max_retries: 3
-  temperature: 0.1             # 工业排查场景建议低温以保持确定性
+  provider: deepseek
+  model: deepseek-v4-flash
+  temperature: 0            # 工业诊断必须可复现，不要调高
+  max_tokens: 4096          # 结构化输出 + 1000 字正文留足余量
+  timeout_s: 60
+  max_retries: 1
+
+timeouts:
+  db_query_s: 30
+
+concurrency:
+  max_workers: 4
