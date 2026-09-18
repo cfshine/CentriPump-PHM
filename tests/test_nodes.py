@@ -25,15 +25,17 @@ from src.sub_agents.data_agent.data_state import DataAgentState
 
 
 def test_public_state_has_expected_contract() -> None:
-    """公共契约 DiagnosisState 只含 Step1 输入 + Step2 产出，不含任何私有字段。"""
+    """公共契约 DiagnosisState 含 Step1 输入 + Step2/Step3 产出，不含私有字段。"""
     fields = set(DiagnosisState.model_fields)
     expected = {
         # A 类：Step 1 输入
-        "device_id", "start_time", "end_time", "alarm_code",
+        "device_id", "start_time", "end_time", "alarm_code", "image_refs",
         # B 类：Step 2 产出（下游 Step4/5/6/7 读取）
         "calculated_metrics", "threshold_flags", "effective_alarm_codes",
         "last_alarm_codes", "all_alarm_codes_in_window",
         "llm_description", "basic_judgment", "rag_search_queries",
+        # C 类：Step 3 产出（人读的描述 + 机器读的强类型盒子）
+        "visual_description", "visual_findings",
     }
     assert fields == expected, f"公共契约发生变化：多={fields - expected} 少={expected - fields}"
 
@@ -122,9 +124,11 @@ def _main_graph_or_skip():
 
 
 def test_step2_subgraph_is_mounted_in_main_graph() -> None:
-    """★ 本次迁移的核心验收：Step 2 作为节点挂在主图上，一行 add_node。"""
+    """★ Step 2 / Step 3 作为节点挂在主图上。"""
     app = _main_graph_or_skip()
-    assert "step2" in app.get_graph().nodes
+    nodes = app.get_graph().nodes
+    assert "step2" in nodes
+    assert "step3" in nodes
 
 
 def test_main_graph_runs_and_private_fields_do_not_leak() -> None:
@@ -153,3 +157,79 @@ def test_main_graph_runs_and_private_fields_do_not_leak() -> None:
 
     # ★ 私有字段不在公共契约里 —— 主图 state 按 DiagnosisState 过滤，它们不会外流
     assert not ({"raw_telemetry_data", "alarm_events"} & set(DiagnosisState.model_fields))
+
+
+# =============================================================================
+# 4. 未提供时间窗口时的软降级（2026-09-17）
+#    背景：真实输入可能"只给图片路径、不给窗口"。以前空窗口会在 fetch_data 里
+#    抛 ValueError 掀翻整张图 —— 连与 Step 2 无关的 Step 3 都轮不到执行。
+# =============================================================================
+
+
+def _data_nodes_or_skip():
+    try:
+        from src.sub_agents.data_agent import data_nodes
+
+        return data_nodes
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"节点模块不可导入（通常是未配置 DEEPSEEK_API_KEY）：{exc}")
+
+
+def test_step2_soft_degrades_without_window() -> None:
+    """★ 未提供窗口：不取数、不计算、**不调大模型**，返回结构完整的空结果。
+
+    三个节点必须做出同样的判断，否则会出现"取数跳过了、语义化却照调模型"的半截状态。
+    """
+    dn = _data_nodes_or_skip()
+    state = {"device_id": "PUMP-IS100-80-160-01", "start_time": "", "end_time": "",
+             "alarm_code": "FAL-104"}
+
+    fetched = dn.fetch_data_node(state)                    # 不查库
+    assert fetched["raw_telemetry_data"] == []
+
+    metrics = dn.calculate_metrics_node({**state, **fetched})
+    assert metrics["calculated_metrics"] == {}
+    assert any("未做时序分析" in f for f in metrics["threshold_flags"])
+    assert metrics["effective_alarm_codes"] == "FAL-104"   # 入参报警码仍带下去
+    assert metrics["all_alarm_codes_in_window"] == []
+
+    sem = dn.semanticize_node({**state, **fetched, **metrics})   # 不调大模型
+    assert "未做时序分析" in sem["llm_description"]
+    assert "未执行时序分析" in sem["basic_judgment"]
+    assert sem["rag_search_queries"] == []
+
+
+def test_window_without_data_is_distinct_from_no_window() -> None:
+    """两种"没东西可算"的告警文案必须不同，否则下游分不清。
+
+    · 未提供窗口   → "未提供时间窗口：本次未做时序分析"
+    · 窗口内无数据 → "无数据：指定时间窗口内无 SCADA 记录"
+    """
+    dn = _data_nodes_or_skip()
+    no_window = dn.calculate_metrics_node({"start_time": "", "end_time": "",
+                                           "raw_telemetry_data": [], "alarm_code": ""})
+    empty_window = dn.calculate_metrics_node({"start_time": "2026-09-13T00:00:00",
+                                              "end_time": "2026-09-13T00:01:00",
+                                              "raw_telemetry_data": [], "alarm_code": ""})
+    assert "未做时序分析" in no_window["threshold_flags"][0]
+    assert "无数据" in empty_window["threshold_flags"][0]
+    assert no_window["threshold_flags"] != empty_window["threshold_flags"]
+
+
+def test_main_graph_runs_without_window() -> None:
+    """★ 端到端：只给图片、不给窗口，主图**不再崩**，Step 3 照常交出契约形状。
+
+    这里用空图片清单（Step 3 零成本短路）以做到不花 API 调用；
+    "有图但没窗口"是同一个代码路径，另有跑批脚本覆盖真实调用。
+    """
+    app = _main_graph_or_skip()
+    out = app.invoke({"image_refs": []})
+
+    # Step 2 明确降级，而不是崩
+    assert out["calculated_metrics"] == {}
+    assert any("未做时序分析" in f for f in out["threshold_flags"])
+    # Step 3 仍然给出恒定形状
+    assert out["visual_description"] == ""
+    findings = out["visual_findings"]
+    images = findings.images if hasattr(findings, "images") else findings["images"]
+    assert images == []

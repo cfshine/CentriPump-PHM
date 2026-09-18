@@ -1,42 +1,33 @@
 # src/orchestrator/graph.py
 """LangGraph 状态图定义（节点拓扑注册、App 编译）。
 
-本文件定义两张图：
+本文件定义：
 
-  1. ``build_data_agent_graph()`` —— Step 2 子图（取数 → 确定性计算 → 语义化）
-     状态用 ``DataAgentState``：继承公共契约 + 补私有字段。
+  1. Step 2 子图 —— 取数 → 确定性计算 → 语义化（``DataAgentState``）
+  2. Step 3 子图 —— 读图 → OCR/视觉 → 固定信封（``VisionAgentState``）
+  3. ``build_main_graph()`` —— 主图串行挂载 Step 2 → Step 3。
 
-  2. ``build_main_graph()``       —— 主图，把 Step 2 子图作为一个节点挂上去。
-
-父子图共享状态的做法（langgraph 1.2.11 实测确认）：
-
-  · 子图 state **继承** ``DiagnosisState`` → 公共字段只定义一次，且子图能读到；
-  · 子图独有的私有字段**不会**回流主图（父图 schema 里没有这些键）；
-  · 因此挂载就是 ``add_node`` 一行，**不需要任何"翻译层"**。
-
-Step 3~7 接入时照此办理：各自建子图，然后在 ``build_main_graph()`` 里加一行。
+``image_refs`` 为空时 Step 3 ingest 直接空信封结束，不调模型。
 """
 from langgraph.graph import StateGraph, START, END
 
 from src.schemas.state import DiagnosisState
-
 from src.sub_agents.data_agent.data_graph import data_agent_graph
+from src.sub_agents.vision_agent.vision_graph import vision_agent_graph
 
 
 def build_main_graph(*, checkpointer=None):
-    """构建主图。
-
-    主图的状态是 ``DiagnosisState``（公共契约）；各 Step 以子图/节点的形式挂上来。
-    当前只接了 Step 2 —— 其余 Step 接入时在这里加 ``add_node`` 与 ``add_edge``。
-    """
+    """构建主图。主图状态是 ``DiagnosisState``（公共契约）。"""
     main = StateGraph(DiagnosisState)
 
     main.add_node("step2", data_agent_graph)
+    main.add_node("step3", vision_agent_graph)
 
     main.add_edge(START, "step2")
-    main.add_edge("step2", END)
+    main.add_edge("step2", "step3")
+    main.add_edge("step3", END)
 
     return main.compile(checkpointer=checkpointer)
 
 
-__all__ = ["data_agent_graph", "build_main_graph"]
+__all__ = ["data_agent_graph", "vision_agent_graph", "build_main_graph"]

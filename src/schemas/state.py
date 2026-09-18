@@ -12,8 +12,8 @@
 所以子图必须"继承公共 + 再补私有"；只定义私有字段的话，子图连 device_id 都读不到。
 
 —— 当前版本的字段范围 ——
-本文件目前只含 **Step 1 输入 + Step 2 产出** 中下游需要读的部分。
-Step 3~7 的公共字段在各自接入时往这里加。
+本文件含 **Step 1 输入 + Step 2 / Step 3 产出** 中下游需要读的部分。
+Step 4~7 的公共字段在各自接入时往这里加。
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from src.schemas.vision import VisionFindings
 
 
 class DiagnosisState(BaseModel):
@@ -42,6 +44,7 @@ class DiagnosisState(BaseModel):
     start_time: str = ""
     end_time: str = ""
     alarm_code: str = ""          # 可选，可能为空字符串 ""
+    image_refs: list[str] = Field(default_factory=list)  # 本地路径或 http(s) URL
 
     # ===================== B 类：Step 2 产出（下游 Step4/5/6/7 读取）=====
     calculated_metrics: dict[str, Any] = Field(default_factory=dict)
@@ -52,6 +55,12 @@ class DiagnosisState(BaseModel):
     llm_description: str = ""                # 工况自然语言描述
     basic_judgment: str = ""                 # 基础判断说明（不涉及故障归因）
     rag_search_queries: list[str] = Field(default_factory=list)   # 供 Step 4 使用的检索词
+
+    # ===================== C 类：Step 3 产出（下游 Step4/5/7 读取）=========
+    # 自然语言描述图像的视觉信息
+    visual_description: str = ""
+    # 视觉信息提取的具体数据
+    visual_findings: VisionFindings = Field(default_factory=VisionFindings)
 
 
     def __getitem__(self, key: str) -> Any:

@@ -73,8 +73,47 @@ class SemanticizeOutput(BaseModel):
 
 # ==================== 节点 1: 拉取数据 ====================
 
+def _has_window(state: DataAgentState) -> bool:
+    """判断本次调用**是否提供了时间窗口**（软降级的唯一判据）。
+
+    参数：
+        state: 子图状态；读 ``start_time`` 与 ``end_time``。
+
+    返回：
+        True  = 起止时间都非空 → 正常做时序分析。
+        False = 缺任一个（或都是空串）→ 三个节点统一按"本次不做时序分析"处理。
+
+    为什么用这一个判据、而不是每处各判一次：
+        三个节点（取数 / 计算 / 语义化）必须**做出同样的判断**，否则会出现
+        "取数跳过了、语义化却照调大模型"这种半截状态。集中成一个函数最不容易漂移。
+    """
+    return bool(
+        str(state.get("start_time") or "").strip()
+        and str(state.get("end_time") or "").strip()
+    )
+
+
 def fetch_data_node(state: DataAgentState):
-    """节点1：调用 MCP 工具获取时间窗口内的原始数据"""
+    """节点1：取时间窗口内的原始遥测。
+
+    参数：
+        state: 子图状态；读 ``device_id`` / ``start_time`` / ``end_time``。
+
+    返回：
+        正常 → ``{"raw_telemetry_data": [ ...每帧一条 dict... ]}``（私有字段，不外流）
+        软降级 → ``{"raw_telemetry_data": []}`` —— **不查库**
+
+    ★ 软降级（2026-09-17 用户拍板）：
+        未提供时间窗口时**直接返回空列表，不做任何数据库查询**。
+        以前空窗口会一路走到 ``_parse_ts`` 抛 ``ValueError: Invalid isoformat string: ''``，
+        把整张 LangGraph 掀翻（实测：只给图片路径的输入会让主图整体失败，
+        连与 Step 2 完全无关的 Step 3 都轮不到执行）。
+        现在它安全退出，把"这次没做时序分析"交给下游两个节点显式表达。
+    """
+    if not _has_window(state):
+        print("[Node 1] 未提供时间窗口 → 跳过时序取数（本次不做时序分析）")
+        return {"raw_telemetry_data": []}
+
     print(f"[Node 1] 拉取 {state['device_id']} 在 {state['start_time']} ~ {state['end_time']} 的数据")
     data = query_scada_telemetry(
         state["device_id"], state["start_time"], state["end_time"]
@@ -86,7 +125,26 @@ def fetch_data_node(state: DataAgentState):
 # ==================== 节点 2: 分段确定性计算 ====================
 
 def calculate_metrics_node(state: DataAgentState):
-    """节点2：分段统计 + 分段告警判定"""
+    """节点2：分段统计 + 分段告警判定（纯 pandas，无数据库/大模型依赖）。
+
+    参数：
+        state: 子图状态；读 ``raw_telemetry_data`` 与 ``alarm_code``。
+
+    返回：
+        正常 → 五个公共字段（``calculated_metrics`` / ``threshold_flags`` /
+               ``effective_alarm_codes`` / ``last_alarm_codes`` / ``all_alarm_codes_in_window``）
+        无数据 → 空指标 + 一条"**未提供时间窗口：本次未做时序分析**"告警
+    """
+    if not _has_window(state):
+        print("[Node 2] 未提供时间窗口 → 跳过确定性计算（本次不做时序分析）")
+        return {
+            "calculated_metrics": {},
+            "threshold_flags": ["未提供时间窗口：本次未做时序分析"],
+            "effective_alarm_codes": state.get("alarm_code", "") or "NONE",
+            "last_alarm_codes": "NONE",
+            "all_alarm_codes_in_window": [],
+        }
+
     print("[Node 2] 开始确定性计算（分段统计）")
 
     df = pd.DataFrame(state["raw_telemetry_data"])
@@ -152,7 +210,32 @@ def calculate_metrics_node(state: DataAgentState):
 
 # ==================== 节点 3: LLM 语义化 ====================
 def semanticize_node(state: DataAgentState):
-    """节点3：LLM 语义化 + 按需核验报警事件"""
+    """节点3：LLM 语义化 + 按需核验报警事件。
+
+    参数：
+        state: 子图状态；读 ``calculated_metrics`` / ``threshold_flags`` /
+               ``all_alarm_codes_in_window`` / ``device_id`` / 时间窗口。
+
+    返回：
+        正常 → ``llm_description`` / ``basic_judgment`` / ``rag_search_queries``
+               + 私有字段 ``alarm_events``（不回流的报警段）
+        软降级 → 同样的四个键，但内容是**确定性模板**，且**不调用大模型**
+
+    ★ 软降级（2026-09-17 用户拍板）：
+        未提供时间窗口时，既不核验报警事件（那也要窗口）、也不调大模型
+        （没有指标可讲，调了只会得到一段没信息量的话，还白花钱）。
+        返回的文本明确写出"本次未做时序分析"，让 Step 4/7 知道这是**没做**，
+        而不是"做了但没发现异常"。
+    """
+    if not _has_window(state):
+        print("[Node 3] 未提供时间窗口 → 跳过语义化（不调用大模型）")
+        return {
+            "llm_description": "未提供时间窗口：本次未做时序分析，无工况描述。",
+            "basic_judgment": "未提供时间窗口，Step 2 未执行时序分析（未取数、未调用大模型）。",
+            "rag_search_queries": [],
+            "alarm_events": [],
+        }
+
     print("[Node 3] 调用大模型生成语义化描述")
 
     metrics = state.get("calculated_metrics", {})
