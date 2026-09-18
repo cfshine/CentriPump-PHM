@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Step 3 视觉子图 · 样例图跑批脚本（走**真实链路**，会调 DeepSeek 视觉模型）。
+"""Step 3 视觉节点 · 样例图跑批脚本（走**真实链路**，会调 DeepSeek 视觉模型）。
 
-用途：把 ``data/sample_inputs/``（含子目录）下的现场图**逐张**喂给真实子图
-``src/sub_agents/vision_agent/vision_graph.py``，并打印每张图的：
-    ① OCR 体检结论（这张图为什么走了/没走"仅 OCR 省钱"）
-    ② 结构化结论（basis / 种类 / 置信度 / 观测 / 未核验项）—— 机器读的那一半
+用途：把 ``data/sample_inputs/``（含子目录）下的现场图**逐张**喂给真实节点
+``src/sub_agents/vision_agent/vision_nodes.py::vision_node``，并打印每张图的：
+    ① OCR 体检结论（这段文字被判成"噪声"还是"有用的信息"）
+    ② 结构化结论（观测 / 极性 / 未核验项）—— 机器读的那一半
     ③ 描述文本（每图一段 + [图N] 锚点 + "本图未核验"）—— 给人读的那一半
-    ④ 末尾汇总表（成功/失败、逐图 basis、种类、置信度、异常条数、字数）
+    ④ 末尾汇总表（成功/失败、观测条数、异常条数、字数）
 
 与 ``pytest`` 的分工：
     · 本脚本 → 批量跑真实 API、给人看结果（慢、要花钱，**不进 CI**）
@@ -128,7 +128,8 @@ def _print_ocr_verdict(ref: Path) -> None:
         生产链路里体检是嵌在 ``analyze_one`` 内部的，只跑一次。
         体检本身失败不影响主流程（只打一行"失败"）。
     """
-    from src.sub_agents.vision_agent.image_tools import assess_ocr, read_image_bytes, resize_for_api
+    from src.sub_agents.vision_agent.image_io import read_image_bytes, resize_for_api
+    from src.sub_agents.vision_agent.ocr_quality import assess_ocr
 
     try:
         verdict = assess_ocr(resize_for_api(read_image_bytes(str(ref))))
@@ -172,17 +173,14 @@ def _print_image(image) -> None:
     返回：
         无返回值，直接打印，形如：
 
-            basis=vision  kind=leak_or_stain  conf=0.82  obs=7  abnormal=3
+            obs=7  abnormal=3
               obs[1] abnormal: 泵轴密封压盖 — 压盖与轴套交界处有深色油性液体附着…
               ! 未核验: 无 OCR 结果，画面中未见可读铭牌、表计读数或屏显信息
     """
     abnormal = sum(1 for o in image.observations if o.polarity == "abnormal")
-    print(f"  basis={image.basis}  kind={image.image_kind}  conf={image.confidence}  "
-          f"obs={len(image.observations)}  abnormal={abnormal}")
+    print(f"  obs={len(image.observations)}  abnormal={abnormal}")
     for i, obs in enumerate(image.observations, 1):
-        q = obs.quantity
-        qs = f"  quantity={q.name}={q.value}{q.unit or ''}" if q else ""
-        print(f"    obs[{i}] {obs.polarity}: {obs.target} — {obs.finding}{qs}")
+        print(f"    obs[{i}] {obs.polarity}: {obs.target} — {obs.finding}")
     for lim in image.limitations:
         print(f"    ! 未核验: {lim}")
 
@@ -258,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 78)
 
     # 延迟导入：没有 Key 时上面就已退出，不会在这里炸出难懂的 ValidationError
-    from src.sub_agents.vision_agent.vision_graph import vision_agent_graph
+    from src.sub_agents.vision_agent.vision_compose import FAILED_PREFIX
+    from src.sub_agents.vision_agent.vision_nodes import vision_node
 
     report: list[dict] = []
     failed = 0
@@ -267,11 +266,11 @@ def main(argv: list[str] | None = None) -> int:
         _print_ocr_verdict(ref)
         started = time.time()
         try:
-            out = dict(vision_agent_graph.invoke({
+            out = vision_node({                     # ★ 现在直接调节点函数（不再是子图）
                 "device_id": args.device_id,
                 "alarm_code": args.alarm_code,
                 "image_refs": [str(ref)],
-            }))
+            })
         except Exception as exc:  # noqa: BLE001 脚本兜底，便于一次跑完看全貌
             failed += 1
             print(f"  ✗ {type(exc).__name__}: {exc}")
@@ -293,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         image = findings.images[0]
-        if image.basis == "failed":
+        if image.natural_description.startswith(FAILED_PREFIX):
             # 逐图兜底的产物：链路没崩，但这张图确实没识别成功 —— 仍算失败
             failed += 1
             reason = image.limitations[0] if image.limitations else "未知原因"
@@ -317,15 +316,16 @@ def main(argv: list[str] | None = None) -> int:
     ok = [r for r in report if r["ok"]]
     print("\n" + "=" * 78)
     print(f"汇总：成功 {len(ok)} / 失败 {failed}")
-    print(f"{'图片':44} {'basis':10} {'kind':18} {'conf':>5} {'abn':>4} {'字数':>6}")
+    print(f"{'图片':44} {'状态':>6} {'观测':>4} {'abn':>4} {'字数':>6}")
     for row, ref in zip(report, images):
         if not row["ok"]:
             print(f"{ref.name:44} {'ERROR':>10} {row['error'][:40]}")
             continue
         image = row["result"]
-        abnormal = sum(1 for o in image["observations"] if o["polarity"] == "abnormal")
-        print(f"{ref.name:44} {image['basis']:10} {image['image_kind']:18} "
-              f"{image['confidence']:>5} {abnormal:>4} {len(row['visual_description']):>6}")
+        observations = image["observations"]
+        abnormal = sum(1 for o in observations if o["polarity"] == "abnormal")
+        print(f"{ref.name:44} {'OK':>6} {len(observations):>4} {abnormal:>4} "
+              f"{len(row['visual_description']):>6}")
     print("=" * 78)
 
     if args.json:
