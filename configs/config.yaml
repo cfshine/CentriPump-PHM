@@ -14,6 +14,10 @@ llm:
   max_tokens: 4096          # 结构化输出 + 1000 字正文留足余量
   timeout_s: 60
   max_retries: 1
+  # Step 3 视觉目前仍在 src/utils/llm_client.py 的 vision_model
+  # （deepseek-flash，与文本网关分开实例）
+vision:
+  model: deepseek-flash
 
 timeouts:
   db_query_s: 30

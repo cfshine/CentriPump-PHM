@@ -17,6 +17,5 @@ test_run*.log
 
 # ---- 数据资产（排除于 Git 外）----
 data/manuals/*
-data/sample_inputs/*
 !data/manuals/.gitkeep
 !data/sample_inputs/.gitkeep
