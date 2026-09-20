@@ -1,1 +1,82 @@
-langgraph
+# CentriPump-PHM · Step2 / Step3 运行依赖
+#
+# 生成方式（2026-09-17）：
+#   1) 从代码里收集 Step2（src/sub_agents/data_agent、src/utils、rules）与
+#      Step3（src/sub_agents/vision_agent）真正 import 的库；
+#   2) 版本**逐一取自 /home/yali_ai/work_file/uv.lock**（不取 pip 的“当前最新”）；
+#   3) 传递依赖从 uv.lock 里按依赖关系展开，仍只保留本子项目用得上的那一支。
+#   已核对：本文件所有版本与 /home/yali_ai/work_file/.venv 实装版本完全一致。
+#
+# 需要 Python 3.12（uv.lock: requires-python ==3.12.*）
+# 安装：  pip install -r requirements.txt
+#
+# ⚠ 两个非 pip 依赖同样必须准备好，否则链路会降级或直接失败：
+#   · Tesseract OCR（Step3）：sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim
+#       没装 → run_ocr() 恒返回空串，所有图都会兜底走视觉大模型（不会崩，但费钱）
+#   · MySQL（Step2）：scada_db，连接参数在 .env
+#   · 环境变量 DEEPSEEK_API_KEY（Step2/3 都靠它，写在 ~/.bashrc）
+
+# ---------------- 直接依赖----------------
+langchain==1.3.17                 # Step2/3  init_chat_model 建模型
+langchain-core==1.6.0             # Step2/3  消息/Prompt/结构化输出
+langchain-deepseek==1.1.0         # Step2/3  model_provider='deepseek' 的后端实现
+langgraph==1.2.11                 # Step2/3  StateGraph 编排（主图 + 子图）
+pandas==3.0.5                     # Step2    DataFrame 时序计算
+numpy==2.3.5                      # Step2    analyzer / timeseries_tools 数值运算
+scipy==1.18.1                     # Step2    timeseries_tools 用 scipy.stats
+sqlalchemy==2.0.52                # Step2    create_engine 连库
+PyMySQL==1.2.0                    # Step2    mysql+pymysql 驱动（运行期必须存在）
+pydantic==2.13.4                  # Step2/3  强类型契约模型
+pydantic-settings==2.15.0         # Step2    读 .env 配置
+python-dotenv==1.2.3              # Step2    pydantic-settings 读 .env 的底层依赖
+PyYAML==6.0.2                     # Step2/3  提示词/配置文件解析
+pillow==12.3.0                    # Step3    缩放、判格式、合成演示图
+pytesseract==0.3.13               # Step3    OCR 调用（包装系统 tesseract）
+pytest==9.1.1                     # 测试     单测与端到端用例
+
+# ---------------- 传递依赖----------------
+annotated-types==0.8.0
+anyio==4.14.2
+certifi==2026.7.22
+charset-normalizer==3.5.1
+distro==1.9.0
+greenlet==3.5.5
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.12.0
+httpx==0.28.1
+httpx2==2.12.0
+idna==3.19
+iniconfig==2.3.0
+jiter==0.16.0
+jsonpatch==1.33
+jsonpointer==3.1.1
+langchain-openai==1.6.0
+langchain-protocol==0.0.18
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.3
+langsmith==0.11.1
+openai==3.3.1
+orjson==3.12.0
+ormsgpack==1.12.2
+packaging==26.3
+pluggy==1.6.0
+pydantic-core==2.46.4
+pygments==2.21.0
+python-dateutil==2.9.0.post0
+regex==2026.7.19
+requests==2.34.2
+requests-toolbelt==1.0.0
+six==1.17.0
+sniffio==1.3.1
+tenacity==9.1.4
+tiktoken==0.14.0
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.7.0
+uuid-utils==0.17.0
+websockets==16.1.1
+xxhash==4.0.1
+zstandard==0.25.0
