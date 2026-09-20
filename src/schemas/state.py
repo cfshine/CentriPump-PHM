@@ -1,757 +1,1839 @@
+"""
+CentriPump-PHM 全局工作流状态定义。
+
+设计目标
+--------
+本文件定义整个故障诊断流程共享的 DiagnosisState。
+
+状态按照业务职责划分为 9 个一级区域：
+
+    DiagnosisState
+    ├── context      # 一次诊断任务的基础上下文 / 输入
+    ├── data         # Step 2：时序数据分析
+    ├── vision       # Step 3：现场图片分析
+    ├── manual       # Step 4：手册 / RAG
+    ├── reasoning    # Step 5：故障归因
+    ├── safety       # Step 6：确定性安全门禁
+    ├── human        # 人工介入
+    ├── delivery     # Step 7：工单与证据溯源
+    └── workflow     # 流程级元数据
+
+这样做的核心目的不是“增加抽象”，而是让 State 本身就能体现系统架构。
+
+例如：
+
+    state.data.metrics
+    state.vision.findings
+    state.manual.evidences
+    state.reasoning.hypotheses
+    state.safety.decision
+
+比：
+
+    state.calculated_metrics
+    state.vision_findings
+    state.manual_evidence
+    state.hypotheses
+    state.guard_decision
+
+更容易阅读，也更容易明确每个 Agent 的职责边界。
+
+
+重要约束
+--------
+1. State 中的数据最终必须能够被 LangGraph Checkpoint 使用的
+   msgpack 序列化。
+
+   因此只允许：
+
+       str
+       int
+       float
+       bool
+       None
+       list
+       dict
+
+   不允许：
+
+       numpy.float64
+       numpy.ndarray
+       pandas.DataFrame
+       datetime
+       ORM 对象
+       SQLAlchemy Session
+       数据库 Engine
+       LLM Client
+       文件对象
+       等等。
+
+
+2. 大型数据不直接进入 State。
+
+   例如：
+
+       SCADA 原始时序数据
+       原始图片二进制
+       完整手册正文
+       完整工单正文
+
+   都不应该进入 checkpoint。
+
+   State 中只保存引用：
+
+       telemetry_ref
+       image_refs
+       manual evidence 的 doc_id/chunk_id
+       report_uri
+       report_ref
+
+
+3. trace_id、时间戳等“一次生成”的值不能使用随机 default_factory。
+
+   例如不能：
+
+       trace_id: str = Field(default_factory=lambda: uuid4().hex)
+
+   因为 State 在 LangGraph 生命周期中可能被多次物化。
+
+   trace_id 应该由入口显式创建并写入 State。
+
+
+4. SafetyState 只能由确定性规则代码产生。
+
+   LLM 可以提供：
+
+       reasoning
+
+   但不能直接决定：
+
+       safety.decision
+       safety.risk_level
+
+   这些必须来自 rules/ 中的确定性逻辑。
+
+
+5. 每个 Agent 尽量只负责自己对应的一级 State。
+
+   例如：
+
+       Data Agent
+           -> data
+
+       Vision Agent
+           -> vision
+
+       Manual Agent
+           -> manual
+
+       Reasoner
+           -> reasoning
+
+       Safety Guard
+           -> safety
+
+       Reporter
+           -> delivery
+"""
+
+
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-# ============================================================
-# 1. 基础类型
-# ============================================================
+# =============================================================================
+# 一、公共基础设施
+# =============================================================================
 
-# 当前工作流整体状态。
+# LangGraph Checkpoint 最终需要处理的基础类型。
+#
 # 注意：
-# 这不是日志状态，也不是数据库中的业务状态。
-# 它描述的是“当前这一次 LangGraph 执行到什么程度、手里有什么材料”。
-WorkflowStatus = Literal[
-    "pending",       # 尚未开始
-    "running",       # 执行中
-    "completed",     # 正常完成
-    "failed",        # 执行失败
-    "blocked",       # 被安全门禁拦截
-]
+#   bool 必须单独包含。
+#   Python 中 bool 是 int 的子类，但这里我们使用 type(value) 精确判断，
+#   所以两者都列出来。
+_ALLOWED_VALUE_TYPES = (
+    str,
+    int,
+    float,
+    bool,
+    type(None),
+    list,
+    dict,
+)
 
 
-# ============================================================
-# 2. Artifact：大型原始材料的引用
-# ============================================================
-
-class ArtifactRef(TypedDict):
+def _assert_checkpoint_safe(value: Any, path: str) -> None:
     """
-    一个大型外部材料的引用。
+    递归检查一个值是否由 checkpoint 可以安全处理的原生类型组成。
 
-    图片、PDF、SCADA 原始数据、最终报告等，不直接放进 LangGraph State。
-    State / Checkpoint 中只保存这个引用。
+    为什么需要这个函数？
+    --------------------
+    如果把 numpy.float64 / datetime / ORM 对象等塞进 State，
+    很可能不是在业务代码执行的时候报错，而是在 checkpoint 保存时才报错。
 
-    实际文件可以放在：
-        - MinIO
-        - S3
-        - OSS
-        - 本地文件存储
+    例如：
 
-    DB 中也可以保存对应的 artifact 记录。
-    """
+        state.data.metrics["rms"] = numpy.float64(1.25)
 
-    # 全局唯一的材料 ID。
-    # 例如：
-    #   IMG-001
-    #   SCADA-001
-    #   MANUAL-001
-    #   REPORT-001
-    artifact_id: str
+    业务代码可能完全正常。
 
-    # 材料类型。
-    artifact_type: Literal[
-        "image",
-        "scada",
-        "manual",
-        "report",
-        "document",
-        "video",
-        "other",
-    ]
+    直到 LangGraph checkpoint：
 
-    # 原始文件名称。
-    # 例如：
-    #   pump_003.jpg
-    #   pump_003_scada.parquet
-    #   centrifugal_pump_manual.pdf
-    name: str
+        TypeError:
+            Type is not msgpack serializable: numpy.float64
 
-    # 文件 MIME 类型。
-    # 例如：
-    #   image/jpeg
-    #   application/pdf
-    #   application/octet-stream
-    mime_type: str
+    这种错误很难排查。
 
-    # 文件在对象存储 / 文件系统中的 URI。
-    #
-    # 注意：
-    # 这里只是引用，不是文件内容。
-    uri: str
+    所以这里在 Pydantic Model 完成校验时主动检查。
 
-    # 文件大小，单位 bytes。
-    size: int
+    为什么使用 type(value) 而不是 isinstance？
+    ------------------------------------------
+    因为某些第三方数值类型可能是 Python 基础类型的子类。
 
-    # 文件 SHA256。
-    #
-    # 用于确认文件完整性，以及避免同一文件重复上传。
-    sha256: str
+    我们希望的是：
 
+        真的就是 float
+        真的就是 int
 
-# ============================================================
-# 3. 工程师 / 用户提供的原始文本
-# ============================================================
+    而不是：
 
-class EngineerInput(TypedDict):
-    """
-    工程师或者运维人员提供的文字描述。
+        “看起来像 float”
 
-    这类数据通常很小，可以直接进入 State。
+    tuple 也主动拒绝。
+
+    虽然某些情况下 msgpack 可以处理 tuple，
+    但经过序列化 / 反序列化之后可能变成 list，
+    会导致 State 往返后的类型不稳定。
+
+    所以项目统一约定：
+
+        tuple -> list
     """
 
-    # 原始输入文本。
-    text: str
+    # dict：递归检查所有 value。
+    if type(value) is dict:
+        for key, item in value.items():
+            _assert_checkpoint_safe(item, f"{path}.{key}")
+        return
 
-    # 输入来源。
-    source: Literal[
-        "engineer",
-        "operator",
-        "user",
-        "system",
-    ]
+    # list：递归检查每一个元素。
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _assert_checkpoint_safe(item, f"{path}[{index}]")
+        return
 
-    # 输入时间。
-    created_at: datetime
+    # 基础类型直接通过。
+    if type(value) in _ALLOWED_VALUE_TYPES:
+        return
+
+    raise TypeError(
+        f"状态字段 {path} 的值类型 "
+        f"{type(value).__name__} 无法安全进入 checkpoint。"
+        "请先转换成原生类型："
+        "str / int / float / bool / None / list / dict。"
+        "numpy 数值请先转换，datetime 请转换为 ISO 字符串，"
+        "tuple 请转换为 list，大型数据请只保存引用。"
+    )
 
 
-# ============================================================
-# 4. Router 输出
-# ============================================================
-
-class RouterResult(TypedDict):
+class StateModel(BaseModel):
     """
-    Router 对当前诊断任务进行路由后的结果。
+    所有 State 子模型的公共基类。
 
-    Router 本身只负责决定需要哪些分析路径。
-    """
+    这里统一放两个规则：
 
-    # 诊断任务类型。
-    intent: Literal[
-        "equipment_fault",
-        "performance_anomaly",
-        "maintenance",
-        "alarm_analysis",
-        "other",
-    ]
+    1. extra="forbid"
 
-    # 是否需要获取 SCADA 数据。
-    need_scada: bool
+       禁止 Agent 往 State 中写入没有声明的字段。
 
-    # 是否需要工程师文本分析。
-    need_engineer_text: bool
+       例如：
 
-    # 是否需要视觉分析。
-    need_vision: bool
+           data.calculated_metric
 
-    # Router 给出的简短任务描述。
-    task_summary: str
+       写成：
 
+           data.calculated_metrics
 
-# ============================================================
-# 5. SCADA 数据
-# ============================================================
+       那么应该立即报错，而不是静默接受。
 
-class ScadaDataRef(TypedDict):
-    """
-    SCADA 原始数据的引用。
+    2. checkpoint 类型安全检查
 
-    原始 SCADA 数据可能非常大，因此不直接进入 Checkpoint。
+       每个 State 子模型创建完成之后，递归检查里面的数据。
     """
 
-    # 对应 Artifact 的 ID。
-    artifact_id: str
+    model_config = ConfigDict(
+        extra="forbid",
+    )
 
-    # 设备 ID。
-    equipment_id: str
+    @model_validator(mode="after")
+    def _checkpoint_safety(self):
+        """
+        检查当前 State Model 内部所有字段的值。
 
-    # SCADA 数据开始时间。
-    start_time: datetime
+        注意：
+        这里只检查“值”，不会限制字段声明必须是什么类型。
+        例如：
 
-    # SCADA 数据结束时间。
-    end_time: datetime
+            dict[str, Any]
 
-    # 数据包含的测点。
-    #
-    # 例如：
-    # [
-    #     "temperature",
-    #     "pressure",
-    #     "flow",
-    #     "vibration"
-    # ]
-    metrics: list[str]
+        仍然可以使用。
+
+        真正进入 checkpoint 的最终值必须经过这里的检查。
+        """
+
+        for field_name in type(self).model_fields:
+            value = getattr(self, field_name)
+
+            _assert_checkpoint_safe(
+                value,
+                field_name,
+            )
+
+        return self
 
 
-class ScadaAnomaly(TypedDict):
+# =============================================================================
+# 二、Context —— Step 1 / 整个诊断任务的基础上下文
+# =============================================================================
+
+
+class ImageRef(StateModel):
     """
-    SCADA Agent 找到的一处异常。
+    现场图片引用。
+
+    图片本体不进入 LangGraph State。
+
+    State 只保存：
+        image_id
+        uri
+        source
+        captured_at
+
+    真正的图片可以存在：
+        本地文件
+        对象存储
+        数据库
+        归档系统
+
+    image_id 是长期身份。
+    uri 只是当前运行环境中的访问地址。
     """
 
-    # 测点名称。
-    metric: str
+    image_id: str = ""
+    """图片唯一 ID。"""
 
-    # 异常发生时间。
-    timestamp: datetime
-
-    # 异常值。
-    value: float
-
-    # 正常范围。
-    normal_range: tuple[float, float]
-
-    # 异常类型。
-    anomaly_type: Literal[
-        "high",
-        "low",
-        "fluctuation",
-        "trend",
-        "spike",
-        "drop",
-        "other",
-    ]
-
-    # 简短描述。
-    description: str
-
-
-class ScadaResult(TypedDict):
+    uri: str = ""
     """
-    SCADA Agent 的结构化分析结果。
+    图片访问地址。
+
+    可以是：
+        本地路径
+        对象存储 URL
+        文件系统 URI
+        归档系统定位符
+    """
+
+    source: str = ""
+    """
+    图片来源。
+
+    例如：
+        INSPECTION
+        OPERATOR
+        SCADA_EXPORT
+    """
+
+    captured_at: str = ""
+    """
+    图片拍摄时间。
+
+    统一使用 ISO 字符串。
+    未知时为空字符串。
+    """
+
+
+class ContextState(StateModel):
+    """
+    一次诊断任务的基础上下文。
+
+    这里放的是：
+
+        “这一次到底在诊断什么？”
+
+    而不是某个 Agent 的分析结果。
+    """
+
+    # -------------------------------------------------------------------------
+    # 诊断任务身份
+    # -------------------------------------------------------------------------
+
+    trace_id: str = ""
+    """
+    整个诊断流程的唯一 ID。
+
+    它同时用于关联：
+
+        LangGraph
+        Log
+        数据库
+        归档数据
+        工单
 
     注意：
-    这里只保存分析结果，不保存完整 SCADA 原始数据。
+    不使用 default_factory 自动生成。
+    应由入口显式生成。
     """
 
-    # SCADA 原始数据引用。
-    data_ref: ScadaDataRef
+    device_id: str = ""
+    """正在诊断的设备编号。"""
 
-    # 检测出的异常。
-    anomalies: list[ScadaAnomaly]
+    start_time: str = ""
+    """诊断数据窗口起点，ISO 字符串。"""
 
-    # 总体趋势描述。
-    trend_summary: str
+    end_time: str = ""
+    """诊断数据窗口终点，ISO 字符串。"""
 
-    # SCADA Agent 对当前数据的摘要。
-    summary: str
+    # -------------------------------------------------------------------------
+    # 用户输入
+    # -------------------------------------------------------------------------
 
-
-# ============================================================
-# 6. Vision 视觉分析
-# ============================================================
-
-class VisionObservation(TypedDict):
+    alarm_code: str = ""
     """
-    Vision Agent 从图片中观察到的一个现象。
+    用户提供的报警码。
+
+    可以为空。
+    """
+
+    user_query: str = ""
+    """
+    用户原始问题。
+
+    例如：
+
+        “3号泵最近振动明显升高，帮忙判断原因。”
+
+    原始问题应该保留，不要只保存 LLM 改写后的内容。
+    """
+
+    # -------------------------------------------------------------------------
+    # 现场图片
+    # -------------------------------------------------------------------------
+
+    image_refs: list[ImageRef] = Field(
+        default_factory=list,
+    )
+    """
+    本次诊断使用的现场图片。
+
+    图片是诊断输入，所以属于 context。
 
     注意：
-    这里应该描述“观察到什么”，而不是直接下最终故障结论。
+        image_refs 只保存图片引用，
+        不保存图片二进制。
     """
 
-    # 对象位置。
-    # 例如：
-    #   "泵轴承区域"
-    #   "机械密封区域"
-    location: str
+    # -------------------------------------------------------------------------
+    # Step 1 Router 输出
+    # -------------------------------------------------------------------------
 
-    # 观察结果。
-    observation: str
+    route_reason: str = ""
+    """
+    Step 1 Router 的分诊理由。
 
-    # 视觉证据的严重程度。
+    注意：
+
+        route_reason != route_steps
+
+    本项目不需要额外维护：
+
+        route_steps = ["data", "vision", ...]
+
+    实际经过了哪些节点，LangGraph 的执行历史 / checkpoint
+    本身就是更可靠的来源。
+
+    这里只保留：
+
+        “为什么这么分诊”
+    """
+
+
+# =============================================================================
+# 三、Data —— Step 2 时序数据分析
+# =============================================================================
+
+class DataDescription(BaseModel):
+    """
+    Data Agent 对原始数据分析结果进行语义化后的单条描述。
+
+    注意：
+    这里描述的是“数据表现出来的现象”，
+    而不是“故障原因”。
+
+    例如：
+        正确：
+            “振动 RMS 在报警前 30 秒持续升高，并超过预警阈值。”
+
+        不应该：
+            “初步判断为轴承故障。”
+
+    后者属于 Reasoning Agent 的因果分析职责。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "TREND",       # 趋势特征
+        "ANOMALY",     # 异常特征
+        "THRESHOLD",   # 阈值越界
+        "CORRELATION", # 多指标之间的相关变化
+        "ALARM",       # 报警相关特征
+        "OTHER",       # 其他数据特征
+    ] = Field(
+        description="该语义特征的类型。"
+    )
+
+    description: str = Field(
+        min_length=1,
+        description=(
+            "对数据现象的自然语言描述。"
+            "只能描述观测到的数据特征，不得直接进行故障归因。"
+        ),
+    )
+
+    evidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "支撑该描述的原始数据字段或计算指标名称。"
+            "例如：['vibration_rms', 'temperature']。"
+        ),
+    )
+
+
+class TelemetryRef(StateModel):
+    """
+    原始遥测数据的引用。
+
+    原始 SCADA 数据不进入 checkpoint。
+
+    凭这些信息，Data Agent 可以重新读取同一个数据窗口。
+    """
+
+    source: str = ""
+    """
+    数据来源。
+
+    例如：
+
+        scada_db.scada_telemetry
+    """
+
+    trace_id: str = ""
+    """对应的诊断 trace_id。"""
+
+    device_id: str = ""
+    """设备编号。"""
+
+    start_time: str = ""
+    """数据窗口开始时间。"""
+
+    end_time: str = ""
+    """数据窗口结束时间。"""
+
+
+class DataQuality(StateModel):
+    """
+    时序数据质量。
+
+    用于区分：
+
+        正常取得数据
+        没有数据
+        数据不完整
+        尚未执行
+
+    这对后续 Safety Guard 很重要。
+    """
+
+    status: Literal[
+        "PENDING",
+        "OK",
+        "EMPTY",
+        "PARTIAL",
+    ] = "PENDING"
+
+    total_points: int = 0
+    """本次实际取得的数据点数量。"""
+
+    reason: str = ""
+    """
+    数据质量异常原因。
+
+    例如：
+
+        “指定时间窗口内没有 SCADA 数据”
+        “窗口前 20 分钟数据缺失”
+    """
+
+
+class AlarmState(StateModel):
+    """
+    报警码相关信息。
+
+    原来这几个字段是：
+
+        effective_alarm_codes
+        last_alarm_codes
+        all_alarm_codes_in_window
+
+    它们本质上属于同一类信息，所以收拢成 alarms。
+    """
+
+    effective: str = "NONE"
+    """
+    当前分析认为有效的报警码组合。
+    """
+
+    last: str = "NONE"
+    """
+    时间窗口内最后出现的非 NONE 报警码组合。
+    """
+
+    all: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    整个窗口内出现过的报警码。
+    """
+
+
+class DataState(StateModel):
+    """
+    Step 2 Data Agent 的全部输出。
+
+    Data Agent 的职责：
+
+        原始 SCADA 数据
+            ↓
+        数据清洗
+            ↓
+        统计 / FFT / 突变检测
+            ↓
+        降维后的事实
+            ↓
+        DataState
+
+    注意：
+    Data Agent 不负责最终故障归因。
+    """
+
+    telemetry_ref: TelemetryRef = Field(
+        default_factory=TelemetryRef,
+    )
+    """
+    原始遥测数据引用。
+
+    不保存原始数据本体。
+    """
+
+    quality: DataQuality = Field(
+        default_factory=DataQuality,
+    )
+    """数据质量。"""
+
+    metrics: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+    """
+    计算后的统计指标。
+
+    例如：
+
+        {
+            "overall": {
+                "rms": 12.3,
+                "mean": 10.2,
+            },
+            "phases": [...]
+        }
+
+    这里允许 Any，但实际写入的数据必须经过 checkpoint
+    原生类型检查。
+
+    不允许：
+
+        numpy.float64
+        numpy.ndarray
+        pandas.Series
+    """
+
+    threshold_flags: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    数据分析阶段发现的阈值异常。
+
+    例如：
+
+        [
+            "VIBRATION_RMS_HIGH",
+            "BEARING_TEMP_HIGH",
+        ]
+
+    这些是“事实 / 判据”，不是最终根因。
+    """
+
+    alarms: AlarmState = Field(
+        default_factory=AlarmState,
+    )
+    """报警码相关信息。"""
+
+    descriptions: list[DataDescription] = Field(
+        default_factory=list,
+        description=(
+            "Data Agent LLM 根据 metrics、threshold_flags 和 alarms "
+            "提取出的结构化数据语义特征。"
+            "每一条描述都必须能够通过 evidence 回溯到具体数据。"
+        ),
+    )
+
+
+
+# =============================================================================
+# 四、Vision —— Step 3 视觉分析
+# =============================================================================
+
+
+class VisionFinding(StateModel):
+    """
+    单条视觉缺陷发现。
+
+    每条 Finding 必须能够回溯到具体 image_id。
+    """
+
+    image_id: str = ""
+    """产生该结论的图片 ID。"""
+
+    defect_type: str = ""
+    """
+    缺陷类型。
+
+    例如：
+
+        CRACK
+        WEAR
+        LEAK
+        SCALE
+    """
+
     severity: Literal[
-        "normal",
-        "minor",
-        "moderate",
-        "severe",
-        "unknown",
-    ]
+        "MINOR",
+        "MODERATE",
+        "SEVERE",
+    ] = "MINOR"
+    """缺陷严重程度。"""
 
+    location: str = ""
+    """缺陷所在设备部件 / 位置。"""
 
-class VisionResult(TypedDict):
+    confidence: float = 0.0
     """
-    Vision Agent 的输出。
-    """
-
-    # 本次视觉分析使用的图片。
-    image_refs: list[ArtifactRef]
-
-    # 图片中的观察结果。
-    observations: list[VisionObservation]
-
-    # 视觉分析摘要。
-    summary: str
-
-
-# ============================================================
-# 7. 工程师文本分析
-# ============================================================
-
-class EngineerAnalysisResult(TypedDict):
-    """
-    对工程师原始描述进行语义提炼后的结果。
-
-    例如：
-        “3号泵这几天声音越来越大，而且振动明显”
-    
-    可以提炼为：
-        symptom = ["abnormal noise", "increased vibration"]
-    """
-
-    # 设备当前表现出的症状。
-    symptoms: list[str]
-
-    # 发生时间 / 持续时间。
-    duration: str
-
-    # 发生条件。
-    operating_condition: str
-
-    # 工程师提供的其他重要上下文。
-    context: list[str]
-
-    # 对工程师描述的结构化摘要。
-    summary: str
-
-
-# ============================================================
-# 8. Evidence Merge
-# ============================================================
-
-class EvidenceItem(TypedDict):
-    """
-    合并后的单条证据。
-
-    Evidence Merge 的作用是把：
-
-        工程师文本
-        SCADA
-        Vision
-        其他材料
-
-    统一整理成 Reasoner 可以使用的证据结构。
-    """
-
-    # 证据唯一 ID。
-    evidence_id: str
-
-    # 证据来源。
-    source: Literal[
-        "engineer",
-        "scada",
-        "vision",
-        "manual",
-        "other",
-    ]
-
-    # 证据内容。
-    #
-    # 这里应该是结构化的小型结果，而不是原始大文件。
-    content: str
-
-    # 证据对应的 Artifact。
-    #
-    # 例如：
-    # 某个 SCADA 异常可以关联 SCADA-001。
-    artifact_ids: list[str]
-
-    # 证据的重要程度。
-    relevance: Literal[
-        "low",
-        "medium",
-        "high",
-    ]
-
-
-class EvidenceMergeResult(TypedDict):
-    """
-    Evidence Merge 的完整结果。
-    """
-
-    # 所有可供后续 Reasoner 使用的证据。
-    evidence: list[EvidenceItem]
-
-    # 对全部证据进行的总体摘要。
-    summary: str
-
-
-# ============================================================
-# 9. Manual：设备手册 / 工程知识匹配结果
-# ============================================================
-
-class ManualReference(TypedDict):
-    """
-    从设备手册中找到的相关内容。
+    视觉模型自身对该发现的置信度。
 
     注意：
-    手册 PDF 本身是 Artifact。
-    这里保存的是被检索出来的相关知识。
+    这是视觉分析结果的一部分。
+
+    它不能直接等价于整个故障诊断的最终置信度。
     """
 
-    # 手册 Artifact。
-    artifact_id: str
-
-    # 手册中的章节。
-    section: str
-
-    # 相关内容。
-    content: str
-
-    # 与当前故障的相关性。
-    relevance: Literal[
-        "low",
-        "medium",
-        "high",
-    ]
-
-
-class ManualResult(TypedDict):
+    evidence: str = ""
     """
-    Manual Agent 的输出。
-    """
-
-    # 找到的相关手册内容。
-    references: list[ManualReference]
-
-    # 手册知识总结。
-    summary: str
-
-
-# ============================================================
-# 10. Reasoner：故障假设
-# ============================================================
-
-class FaultHypothesis(TypedDict):
-    """
-    Reasoner 提出的一个故障假设。
-
-    注意：
-    这里是“假设”，不是最终确定事实。
+    视觉判断依据。
 
     例如：
-        bearing_degradation
-        seal_leakage
-        cavitation
+
+        “叶轮边缘存在明显不规则缺口及局部磨损痕迹。”
     """
 
-    # 故障类型。
-    fault_type: str
 
-    # 故障描述。
-    description: str
-
-    # 支持该假设的证据 ID。
-    supporting_evidence_ids: list[str]
-
-    # 与该假设冲突的证据 ID。
-    conflicting_evidence_ids: list[str]
-
-    # 模型对该假设的置信度。
-    confidence: float
-
-
-class ReasoningResult(TypedDict):
+class VisionState(StateModel):
     """
-    Reasoner 的完整推理结果。
+    Step 3 Vision Agent 输出。
     """
 
-    # 模型提出的所有故障假设。
-    hypotheses: list[FaultHypothesis]
+    status: Literal[
+        "PENDING",
+        "NO_IMAGE",
+        "NO_DEFECT",
+        "DEFECT_FOUND",
+        "FAILED",
+    ] = "PENDING"
+    """
+    视觉分析状态。
 
-    # 模型认为当前最可能的故障。
+    必须区分：
+
+        NO_IMAGE
+            没有图片。
+
+        NO_DEFECT
+            有图片，并且分析后没有发现明显缺陷。
+
+        FAILED
+            有图片，但是视觉分析执行失败。
+
+    这三种情况对后续推理的含义不同。
+    """
+
+    findings: list[VisionFinding] = Field(
+        default_factory=list,
+    )
+    """逐条视觉缺陷发现。"""
+
+    summary: str = ""
+    """
+    面向 Reasoner 的视觉语义摘要。
+
+    findings：
+        偏结构化、偏工单。
+
+    summary：
+        偏语义理解、偏推理。
+    """
+
+
+# =============================================================================
+# 五、Manual —— Step 4 手册 / RAG
+# =============================================================================
+
+
+class ManualEvidence(StateModel):
+    """
+    一条手册证据。
+
+    不把完整手册正文放入 State。
+
+    只保存：
+
+        文档身份
+        chunk 身份
+        章节
+        页码
+        短摘录
+        检索得分
+        检索通道
+
+    真正的完整正文需要时再通过 doc_id / chunk_id 查询。
+    """
+
+    doc_id: str = ""
+    """文档 ID。"""
+
+    chunk_id: str = ""
+    """知识库 chunk ID。"""
+
+    section: str = ""
+    """章节 / 条款号。"""
+
+    page: int = 0
+    """页码。"""
+
+    quote: str = ""
+    """
+    短摘录。
+
+    这里只保留能够帮助审计 / 工单阅读的短文本。
+    不应该把整页手册复制进 checkpoint。
+    """
+
+    score: float = 0.0
+    """检索得分。"""
+
+    channel: Literal[
+        "DENSE",
+        "BM25",
+        "HYBRID",
+    ] = "HYBRID"
+    """该证据来自哪个检索通道。"""
+
+
+class ProcedureRequirement(StateModel):
+    """
+    手册中的规程要求。
+    """
+
+    requirement: str = ""
+    """
+    规程要求内容。
+
+    例如：
+
+        “检查轴承润滑状态后方可继续运行。”
+    """
+
+    source_ref: str = ""
+    """
+    来源引用。
+
+    例如：
+
+        manual_001#chunk_023
+    """
+
+
+class RecommendedAction(StateModel):
+    """
+    基于证据形成的建议动作。
+
+    注意：
+    “建议动作”不等于“安全放行”。
+
+    最终是否允许执行相关操作，
+    仍然需要经过 Safety Guard。
+    """
+
+    action: str = ""
+    """建议动作。"""
+
+    priority: Literal[
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+    ] = "MEDIUM"
+    """建议优先级。"""
+
+    source_ref: str = ""
+    """
+    动作依据。
+
+    可以指向：
+
+        rule_id
+        doc_id#chunk_id
+        image_id
+    """
+
+
+class ManualState(StateModel):
+    """
+    Step 4 Manual Agent 输出。
+    """
+
+    status: Literal[
+        "PENDING",
+        "HIT",
+        "NO_HIT",
+        "FAILED",
+    ] = "PENDING"
+    """
+    RAG 执行状态。
+
+    NO_HIT：
+        搜索成功，但没有找到相关内容。
+
+    FAILED：
+        RAG 系统本身执行失败。
+
+    两者必须区分。
+    """
+
+    evidences: list[ManualEvidence] = Field(
+        default_factory=list,
+    )
+    """真正被 Reasoner / Reporter 使用的手册证据。"""
+
+    mechanism: str = ""
+    """
+    手册知识提炼后的故障机理。
+
+    必须能够回指 evidences。
+    """
+
+    requirements: list[ProcedureRequirement] = Field(
+        default_factory=list,
+    )
+    """规程要求。"""
+
+    actions: list[RecommendedAction] = Field(
+        default_factory=list,
+    )
+    """基于手册证据产生的建议动作。"""
+
+
+# =============================================================================
+# 六、Reasoning —— Step 5 故障归因
+# =============================================================================
+
+
+class Hypothesis(StateModel):
+    """
+    一条故障原因假设。
+
+    即使某个假设最后被否定，也建议保留。
+
+    因为最终工单可能需要展示：
+
+        “排查过什么？”
+        “为什么排除？”
+    """
+
+    cause: str = ""
+    """故障原因。"""
+
+    confidence_level: Literal[
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+    ] = "LOW"
+    """
+    该假设本身的证据强度。
+
+    注意：
+    它不是 Safety Guard 的最终放行依据。
+    """
+
+    support_refs: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    支持该假设的证据引用。
+
+    例如：
+
+        threshold:VIBRATION_RMS_HIGH
+        image:IMG_001
+        manual:MANUAL_001#CHUNK_03
+    """
+
+    contradicting_evidence: str = ""
+    """
+    与该假设矛盾的证据。
+
+    如果没有，留空。
+    """
+
+    status: Literal[
+        "SUPPORTED",
+        "INSUFFICIENT",
+        "CONFLICTED",
+    ] = "INSUFFICIENT"
+    """
+    当前假设状态。
+    """
+
+
+class ReasoningState(StateModel):
+    """
+    Step 5 Reasoner 输出。
+
+    Reasoner 可以调用 LLM。
+
+    但它的输出最终还要经过 Step 6
+    的确定性 Safety Guard。
+    """
+
+    root_cause: str = ""
+    """
+    当前认为最主要的根因。
+
+    该字段应该由 Reasoner 产生。
+
+    Reporter 可以使用，
+    但 Safety Guard 不应该盲信。
+    """
+
+    hypotheses: list[Hypothesis] = Field(
+        default_factory=list,
+    )
+    """
+    全部候选故障原因。
+
+    包括：
+        支持的
+        证据不足的
+        被冲突证据否定的
+    """
+
+    confidence: Literal[
+        "PENDING",
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+    ] = "PENDING"
+    """
+    整体归因置信度。
+
+    使用分档而不是 float，
+    方便确定性规则处理。
+    """
+
+    support_sources: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    支撑最终判断的独立证据来源。
+
+    例如：
+
+        [
+            "DATA",
+            "VISION",
+            "MANUAL",
+        ]
+    """
+
+    summary: str = ""
+    """
+    整体归因链说明。
+
+    用于 Reporter 生成工单正文。
+    """
+
+    insufficient_evidence: bool = False
+    """
+    是否明确判断当前证据不足以完成可靠归因。
+    """
+
+    conflicts: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    当前发现的证据冲突。
+
+    例如：
+
+        “SCADA 振动数据支持轴承异常，
+         但现场图片未发现对应磨损。”
+    """
+
+    used_inputs: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    本次推理实际使用了哪些输入。
+
+    例如：
+
+        [
+            "data",
+            "vision",
+            "manual",
+        ]
+
+    这个字段的意义是：
+    防止 Reasoner 声称“综合了所有信息”，
+    实际上某个 Agent 根本没有提供有效结果。
+    """
+
+
+# =============================================================================
+# 七、Safety —— Step 6 确定性安全门禁
+# =============================================================================
+
+
+class SafetyState(StateModel):
+    """
+    Step 6 Safety Guard 输出。
+
+    ★ 这是整个系统最重要的安全边界之一。
+
+    这里的数据只能由：
+
+        rules/safety_guard.py
+
+    这样的确定性代码产生。
+
+    不允许：
+
+        LLM 直接生成 decision
+        LLM 直接生成 risk_level
+
+    Reasoner 可以说：
+
+        root_cause = “轴承润滑不足”
+
+    但最终：
+
+        PASS
+        MANUAL_REVIEW
+        BLOCK
+        INSUFFICIENT_DATA
+
+    必须由确定性规则计算。
+    """
+
+    risk_level: str = ""
+    """
+    风险等级。
+
+    具体值由：
+
+        rules/ram_matrix.json
+
+    定义。
+
+    因为风险等级是配置驱动的，
+    这里不强行使用 Literal。
+    """
+
+    decision: Literal[
+        "PENDING",
+        "PASS",
+        "MANUAL_REVIEW",
+        "BLOCK",
+        "INSUFFICIENT_DATA",
+    ] = "PENDING"
+    """
+    Safety Guard 最终决策。
+
+    Reporter 应该只把 PASS 当作：
+        “允许生成正式自动工单”
+
+    其他状态应该进入对应的降级 / 人工流程。
+    """
+
+    rule_hits: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    命中的机器可读规则。
+
+    例如：
+
+        [
+            "HIGH_RISK_DEVICE",
+            "LOW_CONFIDENCE",
+            "MISSING_TELEMETRY",
+        ]
+    """
+
+    reasons: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    面向人类的规则说明。
+
+    Reporter 可以直接用于工单。
+    """
+
+
+# =============================================================================
+# 八、Human —— 人工介入
+# =============================================================================
+
+
+class HumanState(StateModel):
+    """
+    人工介入信息。
+
+    Human 和 Safety 必须分开。
+
+    Safety：
+
+        “按照机器规则，现在是否允许继续？”
+
+    Human：
+
+        “人工审核之后，最终做了什么决定？”
+
+    这是两个不同的概念。
+    """
+
+    decision: str = ""
+    """
+    人工最终决定。
+
+    例如：
+
+        允许继续
+        停机检查
+        转现场工程师
+    """
+
+    decided_at: str = ""
+    """人工决定时间，ISO 字符串。"""
+
+    reviewer: str = ""
+    """
+    审核人员。
+
+    可以是：
+        工号
+        用户名
+        姓名
+
+    实际采用什么身份体系由业务系统决定。
+    """
+
+    comment: str = ""
+    """人工审核备注。"""
+
+
+# =============================================================================
+# 九、Delivery —— Step 7 最终交付
+# =============================================================================
+
+
+class EvidenceRef(StateModel):
+    """
+    最终证据链中的一环。
+
+    用来表达：
+
+        最终结论
+            ↓
+        哪个步骤产生
+            ↓
+        哪个 State 字段
+            ↓
+        哪个原始证据
+            ↓
+        原始证据具体在哪里
+    """
+
+    stage: str = ""
+    """
+    产生该证据的步骤。
+
+    例如：
+
+        step2
+        step3
+        step4
+        step5
+        step6
+    """
+
+    field: str = ""
+    """
+    对应 State 字段。
+
+    例如：
+
+        data.threshold_flags
+        vision.findings
+        manual.evidences
+        reasoning.hypotheses
+        safety.rule_hits
+    """
+
+    source_id: str = ""
+    """
+    原始来源 ID。
+
+    例如：
+
+        rule_id
+        doc_id#chunk_id
+        image_id
+    """
+
+    locator: str = ""
+    """
+    进一步定位信息。
+
+    例如：
+
+        页码
+        时间窗口
+        图片区域
+        SCADA 时间戳
+    """
+
+
+class DeliveryState(StateModel):
+    """
+    Step 7 Reporter 输出。
+
+    注意：
+
+    完整工单正文不进入 LangGraph State。
+
+    State 只保存：
+
+        工单身份
+        工单位置
+        工单 hash
+        证据链
+
+    完整工单可以放：
+
+        数据库
+        对象存储
+        文件系统
+        文档服务
+    """
+
+    diagnosed_at: str = ""
+    """
+    正式诊断完成时间。
+
+    必须由 Step 7 显式写入。
+
+    不使用 default_factory。
+    """
+
+    report_ref: str = ""
+    """
+    工单内容 hash。
+
+    用于验证：
+
+        当前工单内容
+        是否就是当时生成的那一份。
+    """
+
+    report_uri: str = ""
+    """
+    工单实际存储位置。
+
+    例如：
+
+        数据库记录 ID
+        对象存储 URI
+        文件路径
+    """
+
+    traceability: list[EvidenceRef] = Field(
+        default_factory=list,
+    )
+    """
+    最终证据链。
+
+    用于：
+
+        审计
+        人工复评
+        故障复盘
+        后续模型训练
+    """
+
+
+# =============================================================================
+# 十、Workflow —— 流程级元数据
+# =============================================================================
+
+
+class WorkflowState(StateModel):
+    """
+    与具体业务 Agent 无关的流程级信息。
+
+    这里故意保持很小。
+
+    不要把：
+
+        current_node
+        last_node
+        retry_count
+        route_steps
+        execution_history
+
+    等大量 LangGraph 执行信息全部复制进业务 State。
+
+    LangGraph 自身的 checkpoint / execution history
+    已经承担了大量这类职责。
+    """
+
+    schema_version: str = "1.0"
+    """
+    State 契约版本。
+
+    如果修改 State 的结构，
+    应该同步升级版本。
+
+    例如：
+
+        1.0
+        1.1
+        2.0
+    """
+
+    degraded_steps: list[str] = Field(
+        default_factory=list,
+    )
+    """
+    已经执行，但发生降级的步骤。
+
+    例如：
+
+        [
+            "step3",
+            "step4",
+        ]
+
+    Step 5 / Step 6 / Step 7
+    可以根据这个字段判断当前流程是否存在降级。
+    """
+
+
+# =============================================================================
+# 十一、DiagnosisState —— LangGraph 全局状态
+# =============================================================================
+
+
+class DiagnosisState(StateModel):
+    """
+    CentriPump-PHM 的 LangGraph 全局状态。
+
+    这是整个项目最重要的数据契约。
+
+    整体结构：
+
+        DiagnosisState
+        │
+        ├── context
+        │     ├── trace_id
+        │     ├── device_id
+        │     ├── time window
+        │     ├── user_query
+        │     └── image_refs
+        │
+        ├── data
+        │     ├── telemetry
+        │     ├── quality
+        │     ├── metrics
+        │     └── alarms
+        │
+        ├── vision
+        │     ├── status
+        │     └── findings
+        │
+        ├── manual
+        │     ├── evidences
+        │     ├── mechanism
+        │     └── requirements
+        │
+        ├── reasoning
+        │     ├── root_cause
+        │     ├── hypotheses
+        │     └── confidence
+        │
+        ├── safety
+        │     ├── risk_level
+        │     ├── decision
+        │     └── rule_hits
+        │
+        ├── human
+        │     ├── decision
+        │     └── reviewer
+        │
+        ├── delivery
+        │     ├── report_ref
+        │     ├── report_uri
+        │     └── traceability
+        │
+        └── workflow
+              ├── schema_version
+              └── degraded_steps
+
+
+    Agent 与 State 的关系：
+
+        Step 1 Router
+            ↓
+        context
+
+        Step 2 Data Agent
+            ↓
+        data
+
+        Step 3 Vision Agent
+            ↓
+        vision
+
+        Step 4 Manual Agent
+            ↓
+        manual
+
+        Step 5 Reasoner
+            ↓
+        reasoning
+
+        Step 6 Safety Guard
+            ↓
+        safety
+
+        Human Review
+            ↓
+        human
+
+        Step 7 Reporter
+            ↓
+        delivery
+
+        workflow
+            ↓
+        所有节点共享
+    """
+
+    # -------------------------------------------------------------------------
+    # 1. 基础上下文
+    # -------------------------------------------------------------------------
+
+    context: ContextState = Field(
+        default_factory=ContextState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. Step 2 数据分析
+    # -------------------------------------------------------------------------
+
+    data: DataState = Field(
+        default_factory=DataState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Step 3 视觉分析
+    # -------------------------------------------------------------------------
+
+    vision: VisionState = Field(
+        default_factory=VisionState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. Step 4 手册 / RAG
+    # -------------------------------------------------------------------------
+
+    manual: ManualState = Field(
+        default_factory=ManualState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Step 5 故障归因
+    # -------------------------------------------------------------------------
+
+    reasoning: ReasoningState = Field(
+        default_factory=ReasoningState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Step 6 确定性安全门禁
+    # -------------------------------------------------------------------------
+
+    safety: SafetyState = Field(
+        default_factory=SafetyState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 7. 人工介入
+    # -------------------------------------------------------------------------
+
+    human: HumanState = Field(
+        default_factory=HumanState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 8. Step 7 最终交付
+    # -------------------------------------------------------------------------
+
+    delivery: DeliveryState = Field(
+        default_factory=DeliveryState,
+    )
+
+    # -------------------------------------------------------------------------
+    # 9. 流程元数据
+    # -------------------------------------------------------------------------
+
+    workflow: WorkflowState = Field(
+        default_factory=WorkflowState,
+    )
+
+    @model_validator(mode="after")
+    def _checkpoint_safety(self) -> "DiagnosisState":
+        """
+        最终再对整个 DiagnosisState 做一次 checkpoint 安全检查。
+
+        子模型本身已经检查过一次。
+
+        这里再次检查的意义是：
+
+        1. 防止运行过程中有人直接修改嵌套数据；
+        2. 作为整个 DiagnosisState 的最终安全边界；
+        3. 将来如果增加特殊字段，不容易漏掉检查。
+        """
+
+        for field_name in type(self).model_fields:
+            value = getattr(self, field_name)
+
+            _assert_checkpoint_safe(
+                value,
+                field_name,
+            )
+
+        return self
+
+
+# =============================================================================
+# 十二、初始 State 构造函数
+# =============================================================================
+
+
+def create_initial_state(
+    *,
+    trace_id: str,
+    device_id: str,
+    start_time: str,
+    end_time: str,
+    user_query: str = "",
+    alarm_code: str = "",
+    image_refs: list[ImageRef] | None = None,
+) -> DiagnosisState:
+    """
+    创建一次新的诊断流程初始 State。
+
+    为什么单独提供这个函数？
+    ------------------------
+    不把“默认值”和“初始化值”混在一起。
+
+    例如：
+
+        trace_id
+
+    是一次诊断任务创建时产生的值。
+
+    它不是 State 的“默认值”。
+
+    正确流程应该是：
+
+        API / main
+            ↓
+        uuid4()
+            ↓
+        create_initial_state(trace_id=...)
+            ↓
+        LangGraph
+
+    而不是：
+
+        DiagnosisState()
+            ↓
+        default_factory=uuid4()
+
+    后者在某些 State 重建场景下容易产生
+    “同一个逻辑流程多个 trace_id” 的问题。
+
+    参数
+    ----
+    trace_id:
+        外部生成的一次诊断唯一 ID。
+
+    device_id:
+        被诊断设备。
+
+    start_time / end_time:
+        SCADA 数据窗口。
+
+    user_query:
+        用户原始问题。
+
+    alarm_code:
+        用户提供的报警码。
+
+    image_refs:
+        现场图片引用。
+    """
+
+    # -------------------------------------------------------------------------
+    # 处理图片列表
     #
-    # 注意：
-    # 这仍然只是 LLM 的判断。
-    # 最终是否允许采取行动，需要经过 safety_guard。
-    primary_hypothesis: str
-
-    # Reasoner 的推理摘要。
-    summary: str
-
-    # 模型输出的建议。
-    recommendation: str
-
-
-# ============================================================
-# 11. Safety Guard：确定性安全门禁
-# ============================================================
-
-class SafetyRuleResult(TypedDict):
-    """
-    单条确定性安全规则的检查结果。
-
-    这个结构非常重要，因为以后需要追溯：
-        “为什么这个操作被允许 / 拦截？”
-    """
-
-    # 规则 ID。
-    # 例如：
-    #   RAM-001
-    #   SAFETY-003
-    rule_id: str
-
-    # 规则版本。
-    rule_version: str
-
-    # 是否通过。
-    passed: bool
-
-    # 规则检查结果说明。
-    message: str
-
-
-class SafetyGuardResult(TypedDict):
-    """
-    Safety Guard 的完整结果。
-
-    Safety Guard 不使用 LLM 做最终安全决策。
-    """
-
-    # 是否通过全部安全检查。
-    passed: bool
-
-    # 最终风险等级。
-    risk_level: Literal[
-        "low",
-        "medium",
-        "high",
-        "critical",
-    ]
-
-    # 每一条规则的检查结果。
-    rules: list[SafetyRuleResult]
-
-    # 如果被拦截，这里说明原因。
-    block_reason: str
-
-    # 安全门禁最终允许执行的动作。
-    #
-    # 例如：
-    #   "generate_report"
-    #   "create_work_order"
-    #   "manual_inspection"
-    #   "shutdown_equipment"
-    allowed_actions: list[str]
-
-
-# ============================================================
-# 12. Reporter：最终报告
-# ============================================================
-
-class ReportResult(TypedDict):
-    """
-    Reporter 的最终结果。
-
-    最终报告文件本身不进入 State。
-    State 中只保存 ArtifactRef。
-    """
-
-    # 最终报告的 Artifact。
-    report_artifact: ArtifactRef
-
-    # 报告标题。
-    title: str
-
-    # 最终诊断结论。
-    conclusion: str
-
-    # 最终建议。
-    recommendation: str
-
-
-# ============================================================
-# 13. 最终业务诊断结果
-# ============================================================
-
-class DiagnosisResult(TypedDict):
-    """
-    一次诊断最终形成的结构化业务结果。
-
-    这个结果未来会同步到 Business DB。
-    """
-
-    # 最终故障类型。
-    fault_type: str
-
-    # 最终风险等级。
-    risk_level: Literal[
-        "low",
-        "medium",
-        "high",
-        "critical",
-    ]
-
-    # 最终诊断结论。
-    conclusion: str
-
-    # 最终处理建议。
-    recommendation: str
-
-    # 最终使用的证据。
-    evidence_ids: list[str]
-
-
-# ============================================================
-# 14. Workflow State
-# ============================================================
-
-class DiagnosisState(TypedDict):
-    """
-    CentriPump-PHM LangGraph 的完整工作流状态。
-
-    ============================================================
-    设计原则
-    ============================================================
-
-    这个 State 会被 LangGraph Checkpointer 持久化。
-
-    因此：
-
-    1. 小型结构化数据可以直接保存。
-    2. 大型文件只保存 ArtifactRef。
-    3. Log 不放进 State。
-    4. 数据库连接、Session 等运行时对象不放进 State。
-    5. HTTP Request、LLM Client 等对象不放进 State。
-    6. 最终业务数据可以从 State 同步到 Business DB。
-    """
-
-    # --------------------------------------------------------
-    # A. Workflow / Run 基础信息
-    # --------------------------------------------------------
-
-    # 一次诊断案件的业务 ID。
-    #
-    # 对应数据库中的 diagnosis_case。
-    case_id: str
-
-    # 一次具体的 LangGraph 执行 ID。
-    #
-    # 一个 case 理论上可以有多次 run。
-    #
-    # 例如：
-    #   第一次运行失败
-    #   第二次从 checkpoint 恢复
-    #
-    # 两次可以属于同一个 case。
-    run_id: str
-
-    # 当前 Graph 版本。
-    #
-    # 用于以后追溯：
-    # “这个诊断当时运行的是哪一个工作流版本？”
-    graph_version: str
-
-    # 工作流当前状态。
-    workflow_status: WorkflowStatus
-
-    # 工作流开始时间。
-    started_at: datetime
-
-    # 最近一次 State 更新时间。
-    updated_at: datetime
-
-    # --------------------------------------------------------
-    # B. 原始输入材料
-    # --------------------------------------------------------
-
-    # 工程师 / 操作员输入的文本。
-    engineer_input: EngineerInput
-
-    # 当前案件涉及的设备 ID。
-    equipment_id: str
-
-    # 当前案件所有原始材料。
-    #
-    # 图片、SCADA、PDF 等大型内容全部通过 ArtifactRef 引用。
-    artifacts: list[ArtifactRef]
-
-    # --------------------------------------------------------
-    # C. Router
-    # --------------------------------------------------------
-
-    # Router 的分析结果。
-    router: RouterResult
-
-    # --------------------------------------------------------
-    # D. SCADA Agent
-    # --------------------------------------------------------
-
-    # SCADA 原始数据引用。
-    #
-    # 这里不是完整 SCADA 数据。
-    scada_data_ref: ScadaDataRef | None
-
-    # SCADA 分析结果。
-    scada_result: ScadaResult | None
-
-    # --------------------------------------------------------
-    # E. Engineer Text Agent
-    # --------------------------------------------------------
-
-    # 工程师文本语义分析结果。
-    engineer_analysis: EngineerAnalysisResult | None
-
-    # --------------------------------------------------------
-    # F. Vision Agent
-    # --------------------------------------------------------
-
-    # Vision 分析结果。
-    vision_result: VisionResult | None
-
-    # --------------------------------------------------------
-    # G. Evidence Merge
-    # --------------------------------------------------------
-
-    # 合并后的证据。
-    evidence: EvidenceMergeResult | None
-
-    # --------------------------------------------------------
-    # H. Manual
-    # --------------------------------------------------------
-
-    # 从设备手册中找到的相关知识。
-    manual: ManualResult | None
-
-    # --------------------------------------------------------
-    # I. Reasoner
-    # --------------------------------------------------------
-
-    # LLM 故障推理结果。
-    reasoning: ReasoningResult | None
-
-    # --------------------------------------------------------
-    # J. Safety Guard
-    # --------------------------------------------------------
-
-    # 确定性安全门禁结果。
-    safety_guard: SafetyGuardResult | None
-
-    # --------------------------------------------------------
-    # K. Final Diagnosis
-    # --------------------------------------------------------
-
-    # 最终结构化诊断结果。
-    #
-    # 通常在 safety_guard 通过之后形成。
-    diagnosis: DiagnosisResult | None
-
-    # --------------------------------------------------------
-    # L. Reporter
-    # --------------------------------------------------------
-
-    # 最终报告结果。
-    report: ReportResult | None
-
-    # --------------------------------------------------------
-    # M. 工单
-    # --------------------------------------------------------
-
-    # 是否需要创建工单。
-    #
-    # 这个字段最终应该由 Safety Guard 决定，而不是 LLM 自己决定。
-    work_order_required: bool
-
-    # 创建后的工单 ID。
-    #
-    # 工单真正的数据应该放 Business DB。
-    # State 中只保存 ID，方便后续节点引用。
-    work_order_id: str | None
+    # 不直接保存调用方传进来的 None。
+    # State 中统一使用 list。
+    # -------------------------------------------------------------------------
+
+    if image_refs is None:
+        image_refs = []
+
+    # -------------------------------------------------------------------------
+    # 构造 State
+    # -------------------------------------------------------------------------
+
+    return DiagnosisState(
+        context=ContextState(
+            trace_id=trace_id,
+            device_id=device_id,
+            start_time=start_time,
+            end_time=end_time,
+            alarm_code=alarm_code,
+            user_query=user_query,
+            image_refs=image_refs,
+            route_reason="",
+        ),
+
+        data=DataState(
+            telemetry_ref=TelemetryRef(
+                source="",
+                trace_id=trace_id,
+                device_id=device_id,
+                start_time=start_time,
+                end_time=end_time,
+            ),
+            quality=DataQuality(
+                status="PENDING",
+                total_points=0,
+                reason="",
+            ),
+            metrics={},
+            threshold_flags=[],
+            alarms=AlarmState(
+                effective="NONE",
+                last="NONE",
+                all=[],
+            ),
+            description="",
+            basic_judgment="",
+            rag_queries=[],
+        ),
+
+        vision=VisionState(
+            status="PENDING",
+            findings=[],
+            summary="",
+        ),
+
+        manual=ManualState(
+            status="PENDING",
+            evidences=[],
+            mechanism="",
+            requirements=[],
+            actions=[],
+        ),
+
+        reasoning=ReasoningState(
+            root_cause="",
+            hypotheses=[],
+            confidence="PENDING",
+            support_sources=[],
+            summary="",
+            insufficient_evidence=False,
+            conflicts=[],
+            used_inputs=[],
+        ),
+
+        safety=SafetyState(
+            risk_level="",
+            decision="PENDING",
+            rule_hits=[],
+            reasons=[],
+        ),
+
+        human=HumanState(
+            decision="",
+            decided_at="",
+            reviewer="",
+            comment="",
+        ),
+
+        delivery=DeliveryState(
+            diagnosed_at="",
+            report_ref="",
+            report_uri="",
+            traceability=[],
+        ),
+
+        workflow=WorkflowState(
+            schema_version="1.0",
+            degraded_steps=[],
+        ),
+    )
