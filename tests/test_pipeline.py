@@ -11,8 +11,20 @@
 ★ 断言口径：绑**物理量**（斜率、点数、段数、报警码集合）而不是绑死某次生成的数据。
   历史教训：同一套用例在同一份代码上跑出过 26/27、9/30、27/30 三种结果，
   根因就是断言绑了"数据指纹"，换一批生成数据就整体崩。
+
+★ 2026-09-20 适配组长 9 盒子契约后的口径变化（本文件已同步）：
+  · 子图仍是 2 节点（analyze + summarize），调用方式不变；
+  · 产出改落在 ``final["data"]``（DataState）里：
+    指标取 ``data.metrics``、规则码取 ``data.threshold_flags``、
+    报警码取 ``data.alarms.effective``、质量取 ``data.quality.status``、
+    描述取 ``data.descriptions``（当前是 1 条 type=OTHER，第 3 步改成多条分类）；
+  · 初始状态必须用组长的 ``create_initial_state(...)`` 构造（start/end 是必填的）；
+  · **降级改用 ``quality_status`` / ``quality_reason_contains`` 断言**，
+    不再检查"无数据"这类中文告警（告警位现在只放规则码）；
+  · **E2 的行为**：入参 alarm_code 不再被采用 —— 窗口内没有报警就是 NONE。
 """
 from src.orchestrator.graph import data_agent_graph as step2_agent
+from src.schemas.state import create_initial_state
 
 # ============================================================
 # 测试用例 - 适配迟滞版 SCADA 生成脚本
@@ -41,23 +53,21 @@ from src.orchestrator.graph import data_agent_graph as step2_agent
 
 
 def _build_state(device_id, start, end, alarm_code=""):
-    """构造初始 State"""
-    return {
-        "device_id": device_id,
-        "start_time": start,
-        "end_time": end,
-        "alarm_code": alarm_code,
-        "raw_telemetry_data": [],
-        "calculated_metrics": {},
-        "threshold_flags": [],
-        "effective_alarm_codes": "",
-        "last_alarm_codes": "",
-        "all_alarm_codes_in_window": [],
-        "llm_description": "",
-        "basic_judgment": "",
-        "rag_search_queries": [],
-        "alarm_events": [],
-    }
+    """构造初始 State（用组长契约里的 ``create_initial_state``）。
+
+    ★ 2026-09-20 起公共契约是 9 个嵌套盒子，**必须**走组长的构造函数：
+      ``start_time`` / ``end_time`` 在他的签名里是必填的（模拟"没给窗口"要显式传空串）。
+
+    ``alarm_code`` 仍然保留在签名里（Step 3 还用它），但 Step 2 **不再读它**：
+    报警码一律以窗口内数据为准，E2 用例专门守护这件事。
+    """
+    return create_initial_state(
+        trace_id=f"test-{device_id}-{start}",
+        device_id=device_id,
+        start_time=start,
+        end_time=end,
+        alarm_code=alarm_code,
+    )
 
 
 # ============================================================
@@ -73,6 +83,20 @@ def _check_expect(expect, actual):
         return [], []
 
     passed, failed = [], []
+
+    # ---- 全局结构不变量（每条用例都查）：descriptions 的条数与 evidence 可回溯性 ----
+    if actual["quality_status"] == "EMPTY":
+        # 降级窗口（没窗口/没数据）：按设计**不生成描述、也不调大模型**
+        if actual["desc_count"] == 0:
+            passed.append("降级窗口：0 条描述（按设计不生成）")
+        else:
+            failed.append(f"降级窗口不该有描述，实际 {actual['desc_count']} 条")
+    elif not (1 <= actual["desc_count"] <= 6):
+        failed.append(f"描述条数 {actual['desc_count']} 超出契约的 1~6")
+    elif actual["bad_evidence"]:
+        failed.append(f"有 evidence 无法回溯到材料：{actual['bad_evidence']}")
+    else:
+        passed.append(f"描述 {actual['desc_count']} 条 {'/'.join(actual['desc_types'])}，evidence 均可回溯")
 
     # ---- 精确断言 ----
     for key in ("points", "phases", "alarm_count", "states"):
@@ -141,9 +165,10 @@ def _check_expect(expect, actual):
         else:
             failed.append(f"states 集合缺少: {missing}（实际 {sorted(actual_set)}）")
 
-    # ---- effective_alarm_codes（精确匹配）----
-    # ★ 原先只支持 contains/excludes，导致 `"effective_alarm_codes": "NONE"`
-    #   这类期望被**静默忽略**（看着像断言，实际没校验）。这里补上精确匹配。
+    # ---- effective_alarm_codes ----
+    # ★ 取值口径：窗口内出现过的报警码，来自 calculated_metrics.overall
+    #   （2026-09-17 精简：顶层 effective_alarm_codes / last_alarm_codes /
+    #     all_alarm_codes_in_window 三个字段已删除，只保留 overall 里这一处）
     exp = expect.get("effective_alarm_codes")
     if exp is not None:
         if exp == actual["effective_alarm_codes"]:
@@ -181,16 +206,9 @@ def _check_expect(expect, actual):
         else:
             failed.append(f"effective_alarm_codes 意外包含: {unexpected}")
 
-    # ---- last_alarm_codes ----
-    exp = expect.get("last_alarm_codes")
-    if exp is not None:
-        actual_last = actual.get("last_alarm_codes", "NONE")
-        if exp == actual_last:
-            passed.append(f"last_alarm_codes={exp}")
-        else:
-            failed.append(f"期望 last_alarm_codes={exp}，实际={actual_last}")
-
     # ---- alarm_contains ----
+    # ★ 2026-09-20 起 threshold_flags 存的是**机器码**（如 BEARING_TEMP_DE_TRIP），
+    #   所以这里比对的是码，不再是中文句子。
     exp = expect.get("alarm_contains")
     if exp is not None:
         all_flags = " | ".join(actual["alarm_flags"])
@@ -209,6 +227,35 @@ def _check_expect(expect, actual):
             passed.append(f"alarm_excludes={exp}")
         else:
             failed.append(f"告警中意外包含: {unexpected}")
+
+    # ---- no_rule_hits_on_states ----
+    # ★ 替代原来的 `alarm_excludes: ["[NORMAL段]"]`：码化以后，"哪一段命中了什么"
+    #   已经落在 phases[*].rule_hits 上，所以可以**直接断言某些状态上不许有命中**，
+    #   比原来"看告警文案里有没有 [NORMAL段] 前缀"更准。
+    exp = expect.get("no_rule_hits_on_states")
+    if exp is not None:
+        offenders = [(s, h) for s, h in actual["phases_rule_hits"] if s in exp and h]
+        if not offenders:
+            passed.append(f"这些状态上无规则命中: {exp}")
+        else:
+            failed.append(f"这些状态上不该有规则命中，实际: {offenders}")
+
+    # ---- quality_status / quality_reason_contains ----
+    # ★ 2026-09-20：降级不再靠"中文告警文案"，改由 data.quality（组长的 DataQuality）表达
+    exp = expect.get("quality_status")
+    if exp is not None:
+        if exp == actual["quality_status"]:
+            passed.append(f"quality_status={exp}")
+        else:
+            failed.append(f"期望 quality_status={exp}，实际={actual['quality_status']}")
+
+    exp = expect.get("quality_reason_contains")
+    if exp is not None:
+        missing = [s for s in exp if s not in actual["quality_reason"]]
+        if not missing:
+            passed.append(f"quality_reason 含 {exp}")
+        else:
+            failed.append(f"quality_reason 缺少: {missing}（实际：{actual['quality_reason']}）")
 
     # ---- expect_data_bug ----
     if expect.get("expect_data_bug"):
@@ -250,35 +297,50 @@ def _run_case(case_id, name, device_id, start, end, alarm_code="", expect=None):
     print(f"{'━' * 80}")
 
     try:
-        final = step2_agent.invoke(_build_state(device_id, start, end, alarm_code))
+        final = step2_agent.invoke(_build_state(device_id, start, end, alarm_code).model_dump())
     except Exception as e:
         print(f"❌ 执行异常: {type(e).__name__}: {e}")
         return None, False
 
-    metrics = final.get("calculated_metrics", {})
+    # ★ 2026-09-20：产出落在 data 盒子里（不再是顶层扁平字段）
+    data = final["data"]
+    metrics = data.metrics
     overall = metrics.get("overall", {})
     phases = metrics.get("phases", [])
-    flags = final.get("threshold_flags", [])
+    flags = data.threshold_flags
 
     actual = {
         "points": overall.get("total_points", 0),
         "phase_count": overall.get("phase_count", 0),
+        # ★ alarm_count 现在是**去重后的规则码种数**（不再是"告警行数"）
         "alarm_count": len(flags),
         "alarm_flags": flags,
         "states": [ph["state"] for ph in phases],
-        "effective_alarm_codes": final.get("effective_alarm_codes", "NONE"),
-        "last_alarm_codes": final.get("last_alarm_codes", "NONE"),
+        # 段级规则命中：[(状态, [码...]), ...]，供 no_rule_hits_on_states 断言
+        "phases_rule_hits": [(ph["state"], ph.get("rule_hits", [])) for ph in phases],
+        # 报警码的唯一出处：data.alarms（组长契约的三件套之一）
+        "effective_alarm_codes": data.alarms.effective,
+        "quality_status": data.quality.status,
+        "quality_reason": data.quality.reason,
         "start_state": overall.get("start_state", "?"),
         "end_state": overall.get("end_state", "?"),
-        "llm_desc_len": len(final.get("llm_description", "") or ""), 
+        "llm_desc_len": sum(len(d.description) for d in data.descriptions),
+        # descriptions 的结构信息（type 六选一、evidence 必须能回溯到材料）
+        "desc_count": len(data.descriptions),
+        "desc_types": [d.type for d in data.descriptions],
+        "bad_evidence": [
+            e for d in data.descriptions for e in d.evidence
+            if e not in (set(overall) | {k for ph in phases for k in ph} | set(flags))
+        ],
     }
 
     # ============ 打印 ============
     print(f"数据点数:   {actual['points']}")
     print(f"阶段数:     {actual['phase_count']}")
     print(f"起始→结束:  {actual['start_state']} → {actual['end_state']}")
-    print(f"全量报警码: {actual['effective_alarm_codes']}")
-    print(f"最后报警码: {actual['last_alarm_codes']}")
+    print(f"数据质量:   {actual['quality_status']}  {actual['quality_reason']}")
+    print(f"描述:       {actual['desc_count']} 条  {'/'.join(actual['desc_types'])}")
+    print(f"窗口内报警码: {actual['effective_alarm_codes']}")
     print(f"告警数:     {actual['alarm_count']}")
 
     for ph in phases:
@@ -293,8 +355,7 @@ def _run_case(case_id, name, device_id, start, end, alarm_code="", expect=None):
     for f in flags:
         print(f"    ⚠ {f}")
 
-    print(f"LLM 描述长度: {len(final.get('llm_description', ''))}")
-    print(f"报警事件数:   {len(final.get('alarm_events', []))}")
+    print(f"LLM 描述长度: {actual['llm_desc_len']}")
 
     # ============ 预期核对 ============
     all_passed = True
@@ -372,8 +433,7 @@ if __name__ == "__main__":
           "states_contains": ["DEGRADING", "WARNING"],
           "alarm_count_min": 4,
           "effective_alarm_codes_contains": ["TAH-101", "TAHH-101", "VAH-102", "VAHH-102"],
-          "last_alarm_codes": "TAHH-101;VAHH-102",
-          "alarm_contains": ["温度超停机线", "温度急剧恶化", "振动超国标"],
+          "alarm_contains": ["BEARING_TEMP_DE_TRIP", "BEARING_TEMP_DE_RAMP_SHARP", "VIB_DE_TRIP"],
           "note": "温度 45→85.5℃ 越停机线，振动最高 5.12mm/s 越国标"}),
 
         ("A3", "只截 WARNING 段（联锁停机前 10 分钟）",
@@ -381,7 +441,7 @@ if __name__ == "__main__":
          {"points": 119, "phases": 1,
           "states": ["WARNING"],
           "alarm_count_min": 4,
-          "alarm_contains": ["温度超停机线", "温度急剧恶化", "振动超国标"],
+          "alarm_contains": ["BEARING_TEMP_DE_TRIP", "BEARING_TEMP_DE_RAMP_SHARP", "VIB_DE_TRIP"],
           "effective_alarm_codes_contains": ["TAH-101", "TAHH-101", "VAH-102", "VAHH-102"],
           "note": "最陡段温度斜率 1.53 ℃/min"}),
 
@@ -398,7 +458,7 @@ if __name__ == "__main__":
          {"points": 713, "phases": 1,
           "states": ["WARNING"],
           "alarm_count_min": 4,
-          "alarm_contains": ["温度超停机线", "振动超国标", "流量工况偏离"],
+          "alarm_contains": ["BEARING_TEMP_DE_TRIP", "VIB_DE_TRIP", "FLOW_DEV"],
           "effective_alarm_codes_contains": ["FAL-104", "TAHH-101", "VAHH-102"],
           "note": "温度最高 89.4℃、振动 4.97mm/s、流量偏离 -20%（原 B1 气蚀用例的替代）"}),
 
@@ -406,19 +466,19 @@ if __name__ == "__main__":
          DEV, T2_CHATTER_S, T2_CHATTER_E, "FAL-104",
          {"points": 315,
           "phases_min": 40, "phases_max": 70,
-          "alarm_count_min": 5,
+          "alarm_count_min": 1,
           "effective_alarm_codes_contains": ["FAL-104"],
           "note": "流量在 85m³/h 阈值附近反复穿越，切出 56 个碎片段"
-                  "（原 B2 动不平衡用例的替代）"}),
+                  "（原 B2 动不平衡用例的替代）★ 码化后去重只剩 1 种码"}),
 
         ("B3", "重启过渡：流量低 + 电机电流欠载（第一天）",
          DEV, "2026-09-13T10:30:00", T1_RESTART_END, "FAL-104;IAL-105",
          {"points": 302, "phases": 1,
           "states": ["WARNING"],
           "alarm_count_min": 3,
-          "alarm_contains": ["流量工况偏离", "电机电流欠载"],
+          "alarm_contains": ["FLOW_DEV", "PRESS_OUT_DEV", "CURRENT_LOW"],
           "effective_alarm_codes_contains": ["FAL-104", "IAL-105"],
-          "note": "重启爬坡期流量偏离 -58%、电流均值 9.45A"
+          "note": "重启爬坡期流量偏离 -58%、出口压力只有额定的 42%、电流均值 9.45A"
                   "（原 B3 滤网堵塞用例的替代）"}),
 
         ("B4", "真实一天（第一天：1 次故障周期 + 1 次重启）",
@@ -434,7 +494,7 @@ if __name__ == "__main__":
          DEV, T2_CHATTER_S, T2_CHATTER_E, "",
          {"points_min": 310, "points_max": 320,
           "phases_min": 40, "phases_max": 70,
-          "alarm_count_min": 5,
+          "alarm_count_min": 1,
           "effective_alarm_codes_contains": ["FAL-104"],
           "note": "56 个碎片段，验证按 operating_state 切段的粒度；不设描述长度上限"}),
 
@@ -450,7 +510,7 @@ if __name__ == "__main__":
          DEV, T2_DAY_START, T2_DAY_END, "",
          {"points_min": 17000, "points_max": 17500,
           "phases_min": 40, "phases_max": 80,
-          "alarm_count_min": 10,
+          "alarm_count_min": 8,
           "effective_alarm_codes_contains": ["FAL-104", "IAL-105", "TAHH-101", "VAHH-102"],
           "max_desc_len": 1000,
           "note": "63 个碎片段、16 条告警，描述应聚焦异常而非逐段罗列"}),
@@ -481,14 +541,15 @@ if __name__ == "__main__":
          {"points": 305, "phases": 1,
           "states": ["WARNING"],
           "alarm_count_min": 3,
-          "alarm_contains": ["流量工况偏离", "电机电流欠载"],
+          "alarm_contains": ["FLOW_DEV", "PRESS_OUT_DEV", "CURRENT_LOW"],
           "note": "两天的重启过渡形态一致，可用于回归对比"}),
 
         ("C6", "未知设备（无数据降级）",
          "PUMP-UNKNOWN", T1_DAY_START, "2026-09-13T00:15:00", "",
-         {"points": 0, "phases": 0, "alarm_count": 1,
-          "alarm_contains": ["无数据"],
-          "note": "触发'无数据'告警，不抛异常"}),
+         {"points": 0, "phases": 0, "alarm_count": 0,
+          "quality_status": "EMPTY",
+          "quality_reason_contains": ["无 SCADA 记录"],
+          "note": "降级不再靠中文告警，改由 data.quality 表达；不抛异常、不调大模型"}),
 
         # ================= D 组：数据一致性（历史 Bug 的守护）=================
         ("D1", "✅ 数据Bug1已修（流量<85 但状态正确标 WARNING）",
@@ -496,8 +557,8 @@ if __name__ == "__main__":
          {"points": 360, "phases": 1,
           "states": ["WARNING"],
           "alarm_count_min": 1,
-          "alarm_contains": ["流量工况偏离"],
-          "alarm_excludes": ["[NORMAL段]"],
+          "alarm_contains": ["FLOW_DEV"],
+          "no_rule_hits_on_states": ["NORMAL"],
           "expect_data_bug": False,
           "note": "流量<85 且状态为 WARNING，不再出现 NORMAL 段的流量偏离误报"}),
 
@@ -514,8 +575,8 @@ if __name__ == "__main__":
          {"points": 5, "phases": 2,
           "states": ["WARNING", "NORMAL"],
           "alarm_count_min": 1,
-          "alarm_contains": ["流量工况偏离"],
-          "alarm_excludes": ["[NORMAL段]"],
+          "alarm_contains": ["FLOW_DEV"],
+          "no_rule_hits_on_states": ["NORMAL"],
           "expect_data_bug": False,
           "note": "流量<85 时状态正确标 WARNING，不误标 NORMAL"}),
 
@@ -525,21 +586,20 @@ if __name__ == "__main__":
           "states": ["TRIP_SHUTDOWN", "WARNING"],
           "note": "TRIP→WARNING 边界正确切段"}),
 
-        # ================= E 组：报警码双通道 =================
-        ("E1", "有报警传入 + 窗口内有报警",
+        # ================= E 组：报警码来源（只认窗口数据） =================
+        ("E1", "有报警传入 + 窗口内有报警（以窗口数据为准）",
          DEV, T1_DEG_START, T1_WARN_END, "TAHH-101;VAHH-102",
          {"points": 480,
           "phases_min": 2, "phases_max": 3,
           "effective_alarm_codes_contains": ["TAH-101", "TAHH-101", "VAH-102", "VAHH-102"],
-          "last_alarm_codes": "TAHH-101;VAHH-102",
-          "note": "effective 全量去重，last 为最后一条组合"}),
+          "note": "窗口内出现过的报警码去重排序；入参不参与计算"}),
 
-        ("E2", "有报警传入 + 窗口内无报警（回退到入参）",
+        ("E2", "有报警传入 + 窗口内无报警（★ 不再回退到入参）",
          DEV, T1_DAY_START, T1_NORMAL_END, "TAHH-101;VAHH-102",
          {"points": 60, "phases": 1, "alarm_count": 0,
-          "effective_alarm_codes": "TAHH-101;VAHH-102",
-          "last_alarm_codes": "TAHH-101;VAHH-102",
-          "note": "窗口内无 alarm，effective/last 回退到入参"}),
+          "effective_alarm_codes": "NONE",
+          "note": "★ 2026-09-17 行为变更：Step 2 不再读用户入参的 alarm_code，"
+                  "窗口内没有报警就是 NONE —— 报警码只有一个真相来源（窗口数据）"}),
 
         ("E3", "无报警传入 + 窗口内有报警",
          DEV, T1_DEG_START, T1_WARN_END, "",
@@ -552,7 +612,6 @@ if __name__ == "__main__":
          DEV, T1_TRIP_START, "2026-09-13T08:20:00", "",
          {"points": 121, "phases": 1, "alarm_count": 0,
           "effective_alarm_codes": "NONE",
-          "last_alarm_codes": "NONE",
           "note": "停机后 alarm_code 归 NONE"}),
 
         ("E5", "多故障混合报警码（第一天全天）",
@@ -578,7 +637,6 @@ if __name__ == "__main__":
          {"points": 2160, "phases": 3,
           "states": ["DEGRADING", "WARNING", "TRIP_SHUTDOWN"],
           "alarm_count_min": 4,
-          "last_alarm_codes": "TAHH-101;VAHH-102",
           "note": "3 段状态机演变路径正确"}),
 
         # ================= H 组：迟滞尾与碎片 =================
@@ -615,7 +673,7 @@ if __name__ == "__main__":
     print(f"\n{'═' * 80}")
     print("全部用例执行完毕 - 汇总")
     print(f"{'═' * 80}")
-    print(f"{'用例':<6}{'名称':<34}{'点数':>6}{'段数':>6}{'告警':>5}{'事件':>6}{'结果':>8}")
+    print(f"{'用例':<6}{'名称':<34}{'点数':>6}{'段数':>6}{'告警':>5}{'报警码':>7}{'结果':>8}")
     print(f"{'-' * 80}")
 
     total = 0
@@ -627,14 +685,16 @@ if __name__ == "__main__":
         if result is None:
             print(f"{case_id:<6}{name:<34}{'❌ 异常':>6}")
             continue
-        m = result.get("calculated_metrics", {})
+        m = result["data"].metrics
         o = m.get("overall", {})
+        codes = result["data"].alarms.effective
+        n_codes = 0 if codes in ("", "NONE") else len([c for c in codes.split(";") if c.strip()])
         mark = "✅" if ok else "❌"
         print(f"{case_id:<6}{name:<34}"
               f"{o.get('total_points', 0):>6}"
               f"{o.get('phase_count', 0):>6}"
-              f"{len(result.get('threshold_flags', [])):>5}"
-              f"{len(result.get('alarm_events', [])):>6}"
+              f"{len(result['data'].threshold_flags):>5}"
+              f"{n_codes:>7}"
               f"{mark:>8}")
 
     print(f"{'═' * 80}")

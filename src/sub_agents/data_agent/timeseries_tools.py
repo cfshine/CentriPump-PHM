@@ -11,12 +11,12 @@ from scipy import stats
 from rules.thresholds import (
     ACTIVE_STATES as _ACTIVE_STATES,
     FLOW_ACTIVE_THRESHOLD_M3H as _FLOW_ACTIVE_THRESHOLD,
+    RULE_CATALOG,
     SLOPE_WINDOW_POINTS,
     TEMP_SLOPE_ACTIVATION_C as _TEMP_SLOPE_ACTIVATION,
     TEMP_SLOPE_MIN_DURATION_SEC as _TEMP_SLOPE_MIN_DURATION_SEC,
     TEMP_SLOPE_MIN_POINTS as _TEMP_SLOPE_MIN_POINTS,
     TEMP_SLOPE_SHARP,
-    TEMP_WARN_C,
 )
 
 def _py(v, ndigits=None):
@@ -73,21 +73,26 @@ def _is_valid_alarm(code) -> bool:
     return isinstance(code, str) and code.strip() not in ("", "NONE", "None", "null")
 
 
-def _extract_alarm_codes(df: pd.DataFrame, fallback_alarm_code: str = "") -> tuple[str, str, list[str]]:
-    """
-    从 DataFrame 中提取有效报警码。
-    
-    返回三元组：
-      - effective_alarm_codes: 窗口内所有出现过的报警码去重排序（分号连接）
-      - last_alarm_codes: 窗口内最后一次非 NONE 的报警码组合
-      - all_codes_list: 去重后的列表形式
+def _extract_alarm_codes(df: pd.DataFrame) -> tuple[str, str, list[str]]:
+    """从窗口内的帧里提取报警码，返回三元组 ``(effective, last, all)``。
+
+    参数：
+        df: 原始遥测 DataFrame，必须含 ``alarm_code`` 列
+            （多码以分号连接，无报警为 ``NONE``）。
+
+    返回：
+        ``effective``: 窗口内出现过的报警码去重排序（";" 连接）；无则 ``"NONE"``
+        ``last``:      窗口内**最后一次**非 NONE 的报警码组合；无则 ``"NONE"``
+        ``all``:       去重后的列表形式；无则 ``[]``
+
+    ★ 2026-09-20：对齐组长契约的 ``AlarmState{effective, last, all}`` 三件套
+      （这三个本来是扁平字段，组长把它们收拢成了子模型）。
+      仍然**只认窗口内的数据** —— Step 2 不读用户入参的 alarm_code。
     """
     valid_rows = df[df['alarm_code'].apply(_is_valid_alarm)]
-    
     if valid_rows.empty:
-        last = (fallback_alarm_code or "NONE").strip()
-        return last, last, []
-    
+        return "NONE", "NONE", []
+
     # 收集窗口内出现过的所有报警码
     all_codes = set()
     for codes_str in valid_rows['alarm_code']:
@@ -95,61 +100,47 @@ def _extract_alarm_codes(df: pd.DataFrame, fallback_alarm_code: str = "") -> tup
             code = code.strip()
             if code:
                 all_codes.add(code)
-    all_codes_list = sorted(all_codes)
-    
-    # 最后一次非 NONE 组合
-    last_alarm_codes = valid_rows['alarm_code'].iloc[-1].strip()
-    
-    # 全量去重排序（分号连接）
-    effective = ";".join(all_codes_list)
-    
-    return effective, last_alarm_codes, all_codes_list
+    all_list = sorted(all_codes)
+
+    effective = ";".join(all_list) if all_list else "NONE"
+    last = valid_rows['alarm_code'].iloc[-1].strip()
+    return effective, last, all_list
 
 
-def _detect_inflection(seg: pd.DataFrame) -> dict:
-    """
-    检测段内关键指标的拐点（首次突破阈值时刻）。
-    
+def _detect_ramp_start(seg: pd.DataFrame) -> dict:
+    """检测段内温度"开始急剧恶化"的时刻。
+
+    参数：
+        seg: 单个状态段的 DataFrame，需含 ``timestamp``（已是 datetime）与 ``temp_de``。
+
     返回：
-      - inflection_time: 温度首次 >= 70℃ 的时刻（无则 None）
-      - inflection_value: 该时刻的温度值（无则 None）
-      - ramp_start_time: 温度斜率首次 >= 0.8 的时刻（无则 None）
+        ``{"ramp_start_time": <ISO 时刻字符串 或 None>}`` ——
+        段内温度用 1 分钟滑窗做线性回归，斜率**首次**达到
+        ``TEMP_SLOPE_SHARP``（0.8 ℃/min）的那一帧时刻。
+        段长不足 1 分钟、或全程没到过该斜率时为 None。
+
+    用途：
+        让 ``_judge_flags`` 能在告警文案里写"约从 08:01:00 开始"，
+        而不是只说"这一段斜率很高" —— 定位到时刻才对处置有用。
     """
-    result = {
-        "inflection_time": None,
-        "inflection_value": None,
-        "ramp_start_time": None,
-    }
-    
-    if len(seg) < 2:
+    result = {"ramp_start_time": None}
+
+    if len(seg) < SLOPE_WINDOW_POINTS:  # 至少 1 分钟数据才谈得上"滑窗斜率"
         return result
-    
-    # 检测温度首次达到预警线的时刻（阈值见 rules/thresholds.py）
-    over_threshold = seg[seg['temp_de'] >= TEMP_WARN_C]
-    if not over_threshold.empty:
-        first = over_threshold.iloc[0]
-        result["inflection_time"] = first['timestamp'].isoformat()
-        result["inflection_value"] = float(first['temp_de'])
-    
-    # 检测斜率首次达到"急剧恶化"的时刻（用 1 分钟滑窗斜率）
-    if len(seg) >= SLOPE_WINDOW_POINTS:  # 至少 1 分钟数据
-        t0 = seg['timestamp'].min()
-        minutes = (seg['timestamp'] - t0).dt.total_seconds() / 60
-        # 滑动窗口回归（每 1 分钟 = SLOPE_WINDOW_POINTS 点）
-        rolling_slopes = []
-        for i in range(SLOPE_WINDOW_POINTS, len(seg) + 1):
-            window_min = minutes.iloc[i-SLOPE_WINDOW_POINTS:i]
-            window_temp = seg['temp_de'].iloc[i-SLOPE_WINDOW_POINTS:i]
-            if window_min.max() - window_min.min() > 0:
-                slope = stats.linregress(window_min, window_temp).slope
-                rolling_slopes.append((seg['timestamp'].iloc[i-1], slope))
-        
-        # 找第一个斜率 >= 急剧恶化阈值的时刻
-        for ts, slope in rolling_slopes:
-            if slope >= TEMP_SLOPE_SHARP:
-                result["ramp_start_time"] = ts.isoformat()
-                break
-    
+
+    t0 = seg['timestamp'].min()
+    minutes = (seg['timestamp'] - t0).dt.total_seconds() / 60
+
+    # 滑动窗口回归（每 1 分钟 = SLOPE_WINDOW_POINTS 点），找第一个越阈值的时刻
+    for i in range(SLOPE_WINDOW_POINTS, len(seg) + 1):
+        window_min = minutes.iloc[i-SLOPE_WINDOW_POINTS:i]
+        window_temp = seg['temp_de'].iloc[i-SLOPE_WINDOW_POINTS:i]
+        if window_min.max() - window_min.min() <= 0:
+            continue
+        if stats.linregress(window_min, window_temp).slope >= TEMP_SLOPE_SHARP:
+            result["ramp_start_time"] = seg['timestamp'].iloc[i-1].isoformat()
+            break
+
     return result
 
 
@@ -172,8 +163,50 @@ def _format_phases_for_llm(phases: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+def render_rule_hits(phases: list[dict]) -> str:
+    """把分段上的规则码渲染成大模型可读的中文事实句（**只在提示词里用，不进 state**）。
+
+    参数：
+        phases: 含 ``rule_hits`` 的分段列表（即 ``calculated_metrics["phases"]``）。
+
+    返回：
+        每行一条，形如
+        ``- [WARNING段 08:00:05~08:09:55] 驱动端温度超停机线（BEARING_TEMP_DE_TRIP）``；
+        一条命中都没有时返回 ``"无"``。
+
+    为什么 state 里不存中文句子：
+        state 只留机器码（短、稳定、可溯源），中文只在拼提示词的这一刻生成。
+        具体观测值也不在这里重复 —— 分阶段指标已经把每段数值列全了。
+        少数规则要附的上下文（如温度斜率"约从 08:01:00 开始"）由码表的
+        ``extra_field`` / ``extra_template`` 声明，取不到就不加。
+    """
+    lines = []
+    for ph in phases:
+        for code in ph.get("rule_hits", []):
+            spec = RULE_CATALOG.get(code, {})
+            label = spec.get("label", code)
+
+            extra = ""
+            extra_field = spec.get("extra_field")
+            if extra_field and ph.get(extra_field):
+                extra = spec["extra_template"].format(v=str(ph[extra_field])[-8:])
+
+            lines.append(
+                f"- [{ph['state']}段 {ph['start'][-8:]}~{ph['end'][-8:]}] "
+                f"{label}（{code}）{extra}"
+            )
+    return "\n".join(lines) or "无"
+
+
 def _format_overall(overall: dict) -> str:
-    """把 overall dict 格式化成 LLM 易读的文本块。"""
+    """把 overall dict 格式化成 LLM 易读的文本块。
+
+    参数：
+        overall: Node ``analyze`` 产出的窗口概要（``calculated_metrics.overall``）。
+
+    返回：
+        多行文本；``overall`` 为空时返回"（无全局概要）"。
+    """
     if not overall:
         return "（无全局概要）"
     return (
@@ -183,35 +216,7 @@ def _format_overall(overall: dict) -> str:
         f"- 结束状态：{overall.get('end_state', 'UNKNOWN')}\n"
         f"- 是否发生停机：{overall.get('has_shutdown', False)}\n"
         f"- 阶段数：{overall.get('phase_count', 0)}\n"
+        f"- 窗口内出现过的报警码：{overall.get('effective_alarm_codes', 'NONE')}\n"
         f"- 全程最高温度(驱动端)：{overall.get('max_temp_de_overall', '?')} ℃\n"
         f"- 全程最高振动(驱动端)：{overall.get('max_vib_de_overall', '?')} mm/s"
     )
-
-def _format_alarm_events_for_llm(events: list[dict]) -> str:
-    """把报警段序列渲染成给大模型看的文本。
-
-    输入是 query_alarm_events 的游程编码结果：**每段 = 一次连续报警**，
-    带报警码、首末时间、持续时长，以及报警开始/结束时的设备状态与段内峰值。
-
-    ★ 与旧版的区别：旧版是"每帧一行"，要靠 is_new_alarm 过滤后才勉强可用；
-      现在是"每次报警一段"，天然无冗余帧，且多了"持续了多久"这个关键信息。
-    """
-    if not events:
-        return "报警事件序列：（窗口内无报警事件）"
-
-    lines = ["报警事件序列（每段 = 一次连续报警，含持续时长与报警时的设备状态）："]
-    for ev in events:
-        # 被上限保护折叠的摘要行
-        if "note" in ev:
-            lines.append(f"  [{ev['alarm_code']}] {ev['note']}")
-            continue
-
-        s, e, pk = ev["state_at_start"], ev["state_at_end"], ev["peak"]
-        lines.append(
-            f"  {ev['alarm_code']} | {ev['start'][-8:]}~{ev['end'][-8:]}"
-            f" | 持续{ev['duration_sec']}s | {ev['start_state']}→{ev['end_state']}"
-            f" | 温度(de){s['temp_de']}→{e['temp_de']}℃(峰{pk['temp_de']})"
-            f" | 振动(de){s['vib_rms_de']}→{e['vib_rms_de']}mm/s(峰{pk['vib_rms_de']})"
-            f" | 流量{s['flow_rate']}m³/h"
-        )
-    return "\n".join(lines)

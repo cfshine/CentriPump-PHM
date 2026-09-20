@@ -3,14 +3,15 @@
 
 本文件定义：
 
-  1. Step 2 —— 子图：取数 → 确定性计算 → 语义化（``DataAgentState``，2 个私有字段）
+  1. Step 2 —— 子图：取数+确定性计算 → 语义化（analyze + summarize 两节点；
+     **无私有字段**，直接用公共契约 ``DiagnosisState`` 当 state）
   2. Step 3 —— **普通节点函数** ``vision_node``：读图 → OCR 辅助 → 视觉大模型
      （没有私有状态、只有线性流程，所以不包子图；2026-09-17 精简）
   3. ``build_main_graph()`` —— 主图串行挂载 Step 2 → Step 3。
 
 两个节点都有"缺输入就安全退出"的行为，所以主图不需要额外的条件边：
   · ``image_refs`` 为空 → Step 3 一行日志直接返回；
-  · 没有时间窗口   → Step 2 三个节点各自软降级（不查库、不算、不调大模型）。
+  · 没有时间窗口   → Step 2 两个节点各自软降级（不查库、不算、不调大模型）。
 """
 from langgraph.graph import StateGraph, START, END
 

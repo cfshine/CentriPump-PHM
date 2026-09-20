@@ -2,8 +2,12 @@
 
 > **这份文档回答三件事**：
 > 1. 数据从 Step 1 进来、到最终出去，**中间变成了什么形状**（用真实测试用例逐步展示）
-> 2. 每个关键设计**为什么这么做**（尤其是"为什么按状态分段"这类问题）
+> 2. 每个关键设计**为什么这么做**
 > 3. **怎么提测**
+>
+> ★ **v2（2026-09-17）**：整个子图做了一次"去繁从简" —— 3 节点压成 2 节点、
+> 公共字段 8 → 3、私有字段 2 → 0、数据库查询 2 次 → 1 次。
+> 变更清单与理由见 §3.14~§3.16。
 
 ---
 
@@ -11,34 +15,52 @@
 
 **一句话**：把 Step 1 递来的「一台设备 + 一个时间窗口」，变成一份结构化的工况分析结论，交给下游四个 Step。
 
+**职责边界（三件事，不多不少）**：
+
+```
+   ① 取 SCADA 数据        ② 确定性计算（描述状态，不做判断/推理）
+   ③ 让大模型把算好的数字翻译成人话
+```
+
 ```
                   ┌──────────────────────────────────────────┐
    Step 1 ───────►│  data_agent（Step 2）                     │
-   4 个字段        │  fetch_data → calculate_metrics           │
-                  │             → semanticize                 │
-                  └────────────────┬─────────────────────────┘
-                                   │ 只回写公共字段
-        ┌──────────────────────────┼──────────────────────────┐
-        ▼                          ▼                          ▼
-   calculated_metrics        llm_description            threshold_flags
-   （→ Step 5 因果归因）      （→ Step 4 RAG 检索）        （→ Step 6 安全门禁）
+   state.context   │  analyze（取数 + 确定性计算）              │
+   ├ device_id     │      ↓                                    │
+   ├ start_time    │  summarize（大模型语义化）                 │
+   └ end_time      └────────────────┬─────────────────────────┘
+                                    │ 只回写 data 一个盒子
+                                    ▼
+                          state.data（DataState）
+        ┌───────────────┬───────────────┬──────────────┬──────────────┐
+        ▼               ▼               ▼              ▼              ▼
+     metrics     threshold_flags      alarms      descriptions   quality
+   （→ Step 5）   （→ Step 6 门禁）  （报警事实）  （→ Step 4 RAG） （数据质量）
 ```
+
+> ★ 2026-09-20：组长的 ``DiagnosisState`` 改成 9 个嵌套盒子
+> （context / data / vision / manual / reasoning / safety / human / delivery / workflow），
+> **Step 2 只读 `context`、只写 `data`**。挂载走路线 B：主图 `data_node` 转调
+> `data_graph.run_data_agent(state)`，后者只回写 `{"data": ...}`
+> （data 与 vision 是并行分支，多写一个顶层键就会覆盖 vision 的产出）。
 
 ### 文件清单
 
 | 文件 | 行数 | 职责 | 依赖 LangGraph？ |
 | :--- | ---: | :--- | :---: |
-| `data_state.py` | 42 | 子图状态：**继承**公共契约 + 补 2 个私有字段 | ❌ |
-| `data_graph.py` | 25 | 子图定义（3 个节点 + 边） | ✅ 唯一 |
-| `data_nodes.py` | 227 | 3 个节点适配函数 + **分段编排**（解包 → 切段 → 调用 → 回写） | ✅ |
-| `data_tools.py` | 179 | 取数：逐帧遥测 + 报警段（游程编码） | ❌ |
+| `data_graph.py` | 67 | 子图定义（2 个节点 + 边）+ 路线 B 入口 `run_data_agent` | ✅ 唯一 |
+| `data_nodes.py` | 326 | 2 个节点适配函数 + LLM 输出契约 + `_data_update` 回写助手 | ✅ |
+| `data_tools.py` | 60 | 取数：**一条 SQL** 按设备 + 窗口取帧 | ❌ |
 | `repository.py` | 107 | `scada_telemetry` 表结构与 ORM | ❌ |
-| `analyzer.py` | 233 | **段内**统计指标 + 规则判定（纯 pandas，核心算法） | ❌ |
-| `timeseries_tools.py` | 216 | 滑窗 / 回归 / CV / 文本格式化工具 | ❌ |
+| `analyzer.py` | 248 | **段内**统计指标 + 规则判定（产出机器码，纯 pandas，核心算法） | ❌ |
+| `timeseries_tools.py` | 222 | 滑窗 / 回归 / CV / 报警码提取 / 文本格式化 / 规则码渲染 | ❌ |
 
 > **`analyzer.py` 与 `timeseries_tools.py` 不含任何 LangGraph 与数据库依赖**，
 > 只吃 DataFrame、只吐 dict/数值 —— 所以它们可以脱离图和数据库单独测试。
 > 这是刻意的：算法归算法，编排归编排。
+>
+> **`data_state.py` 已删除**：Step 2 现在没有私有字段，子图直接拿公共契约
+> `DiagnosisState` 当自己的 state（理由见 §3.15）。
 
 ---
 
@@ -49,8 +71,8 @@
 ```bash
 cd /home/yali_ai/work_file/LLM_Project/CentriPump-PHM
 
-# 解释器：项目当前使用的 venv（已装 langgraph / langchain / pandas / sqlalchemy / pymysql）
-PY=/home/yali_ai/work_file/LLM_test/day19_项目测试/step2_analysisAgent/backend/.venv/bin/python
+# 解释器：项目自身 venv（含 langgraph / langchain / pandas / sqlalchemy / pymysql）
+PY=/home/yali_ai/work_file/.venv/bin/python
 
 # 大模型凭据：从系统环境变量读，代码里不做任何显式声明
 eval "$(grep -E '^export DEEPSEEK_API_KEY=' ~/.bashrc)"
@@ -61,10 +83,12 @@ eval "$(grep -E '^export DEEPSEEK_API_KEY=' ~/.bashrc)"
 ### 1.2 两条提测命令
 
 ```bash
-# ① 契约与挂载测试 —— 不需要数据库、不需要网络
+# ① 契约与节点行为测试 —— 不需要数据库、不需要网络
 $PY -m pytest tests/test_nodes.py -q
-#    期望：9 passed
-#    覆盖：状态分层契约 / 阈值唯一出处 / Step2 子图能挂进主图 / 私有字段不外流
+#    期望：27 passed（有 Key）；涉及建图/取数的用例在无 Key 时自动跳过
+#    ⚠ 全量 `pytest tests/` 目前有 2 个 FAILED，都在 tests/test_vision_agent.py ——
+#      那是 Step 3 还没适配 9 盒子契约（本轮范围外），Step 2 自身全绿
+#    覆盖：公共契约 / 子图 2 节点 / 报警码只认窗口数据 / 软降级 / 阈值唯一出处 / 主图挂载
 
 # ② 端到端回归 —— 需要 MySQL + 大模型 Key
 $PY -m tests.test_pipeline
@@ -72,15 +96,18 @@ $PY -m tests.test_pipeline
 #    覆盖：30 个真实窗口，含故障周期、窗口边界、停机、重启、碎片、降级
 ```
 
+> ①里的取数用例用 `monkeypatch` 注入合成帧，所以**离线可跑** ——
+> "未提供窗口不查库"、"窗口无数据降级"、"报警码不读用户入参" 都不需要 MySQL。
+
 ### 1.3 命令失败自查
 
 | 现象 | 原因 | 处理 |
 | :--- | :--- | :--- |
 | `ImportError: cannot import name 'model'` | `src/utils/llm_client.py` 不完整 | 确认文件末尾有 `model = init_chat_model(...)` |
 | 全部用例 `points=0` | 数据库没起 / 窗口无数据 | `mysql -h127.0.0.1 -uroot -e "USE scada_db; SELECT COUNT(*) FROM scada_telemetry;"` |
-| `ValidationError: Extra inputs are not permitted` | `.env` 里有 `Setting` 类未声明的键 | 对照 `.env.example` 与 `src/utils/config_loader.py` |
-| 描述长度断言失败 | 大模型输出波动 | 见 §3.11，检查提示词的长度预算是否需要再收紧 |
-| 挂载测试 skip | 没配 `DEEPSEEK_API_KEY` | `eval "$(grep -E '^export DEEPSEEK_API_KEY=' ~/.bashrc)"` |
+| `ValidationError: Extra inputs are not permitted` | 往 state 里塞了未声明的键（如已删除的私有字段） | 对照 `src/schemas/state.py` |
+| 描述长度断言失败 | 大模型输出波动 | 见 §3.12，检查提示词的长度预算是否需要再收紧 |
+| 图构建类用例 skip | 没配 `DEEPSEEK_API_KEY` | `eval "$(grep -E '^export DEEPSEEK_API_KEY=' ~/.bashrc)"` |
 
 > `tests/test_pipeline.py` 是**脚本式**的（`python -m` 跑），不是 pytest 用例；
 > 它输出 30 行逐用例核对表 + 汇总的 `通过: N/30`。
@@ -95,16 +122,17 @@ $PY -m tests.test_pipeline
 
 | 阶段 | 谁在算 | 数据形态 | 规模 |
 | :--- | :--- | :--- | :--- |
-| 0 输入 | Step 1 | 4 个字段 | 4 个值 |
+| 0 输入 | Step 1 | 3 个字段 | 3 个值 |
 | 1 取数 | Python / MySQL | `list[dict]`，11 列 | **480 条 ≈ 5280 个数字** |
-| 2a 切段 | Python | 状态段列表 | **480 点 → 2 段** |
-| 2b 算指标 | Python | 每段 25 个统计量 | **2 × 25 = 50 个数字** |
-| 2c 规则判定 | Python | 中文告警 | **5 条** |
-| 2d 报警段 | Python | 游程编码 | **18 段** |
-| 3 语义化 | **大模型** | 1 段文字 + 3 字段 | **1 × 约 570 字** |
-| 4 输出 | 图回流 | 12 公共 + 2 私有 | 14 个键 |
+| 1a 切段 | Python | 状态段列表 | **480 点 → 2 段** |
+| 1b 算指标 | Python | 每段 21 个统计量 | **2 × 21 = 42 个数字** |
+| 1c 规则判定 | Python | 规则码（机器码） | **5 种**（去重） |
+| 1d 报警码 | Python | 去重集合 | **4 个码** |
+| 2 语义化 | **大模型** | 1~6 条按 type 分类的现象描述 | **约 400~600 字** |
+| 3 输出 | 图回流 | **data 盒子**（6 个子字段） | 1 个顶层键 |
 
-> **大模型只在阶段 3 出现，且拿到的全是算好的数字，碰不到原始数据。**
+> **大模型只在阶段 2 出现，且拿到的全是算好的数字，碰不到原始数据。**
+> 阶段 1 的四小步全在一个节点（`analyze`）里跑，**原始遥测只活在函数局部变量里**。
 
 ---
 
@@ -114,16 +142,17 @@ $PY -m tests.test_pipeline
 {
   "device_id": "PUMP-IS100-80-160-01",
   "start_time": "2026-09-13T07:30:00",
-  "end_time": "2026-09-13T08:09:55",
-  "alarm_code": ""
+  "end_time": "2026-09-13T08:09:55"
 }
 ```
 
-只有 4 个字段。**窗口由 Step 1 推导**（通常是"报警时刻前推 N 分钟"），Step 2 不猜窗口。
+只有 3 个字段。**窗口由 Step 1 推导**（通常是"报警时刻前推 N 分钟"），Step 2 不猜窗口。
+
+> `alarm_code` 仍然在公共契约里（Step 3 的视觉提示词要用），但 **Step 2 不读它**（见 §3.14）。
 
 ---
 
-### 阶段 1 ｜Node 1 `fetch_data`：取原始遥测
+### 阶段 1a ｜`analyze` 取数：一条 SQL 拿回原始遥测
 
 调 `query_scada_telemetry()`，返回 `list[480 个 dict]`，每个 11 个键：
 
@@ -141,11 +170,12 @@ $PY -m tests.test_pipeline
 
 **`temp_de` 从 45.5 → 85.5℃ 就是这条数据的主线。**
 
-> ⚠️ 这 480 条是**私有字段**（`raw_telemetry_data`），只留在子图 state 里，**不会回流主图**。
+> 这 480 条**不进 state**：它们只在 `analyze_node` 的局部变量里存在，
+> 函数返回时只交出"压缩后的小结果"。这是 v2 精简的核心收益（见 §3.15）。
 
 ---
 
-### 阶段 2a ｜切段：把 480 点压成 2 段
+### 阶段 1b ｜切段：把 480 点压成 2 段
 
 ```python
 df['_seg_id'] = (df['operating_state'] != df['operating_state'].shift()).cumsum()
@@ -159,129 +189,173 @@ df['_seg_id'] = (df['operating_state'] != df['operating_state'].shift()).cumsum(
 
 ---
 
-### 阶段 2b ｜`_segment_metrics`：每段算 25 个统计量
+### 阶段 1c ｜`_segment_metrics`：每段算 21 个统计量
 
-以**段 2（WARNING）**为例：
+以**段 2（WARNING）**为例，21 个键**全部列出**（数值取自本窗口实跑结果）：
 
 ```jsonc
 {
-  "start": "2026-09-13T08:00:05", "end": "2026-09-13T08:09:55",
-  "duration_sec": 590, "data_points": 119,
-  "avg_flow": 99.97, "cv_flow": 0.51,              // 水力
-  "slope_temp_de": 1.529, "max_temp_de": 85.5,     // 温度 ← 关键
-  "slope_vib_de": 0.208,  "max_vib_de": 5.12,      // 振动 ← 关键
-  "avg_motor_current": 22.51, "max_motor_current": 23.08,
-  "inflection_time": "2026-09-13T08:00:05",        // 首次越预警线的时刻
-  "inflection_value": 70.5,
-  "ramp_start_time": "2026-09-13T08:01:00",        // 斜率首次达"急剧恶化"的时刻
-  "state": "WARNING"
+  // —— 段定位（4）——
+  "start": "2026-09-13T08:00:05",   // 该段起点时刻
+  "end": "2026-09-13T08:09:55",     // 该段终点时刻
+  "duration_sec": 590,              // 段持续秒数
+  "data_points": 119,               // 段内帧数（5s 一帧）
+
+  // —— 水力（5）——
+  "avg_flow": 99.97,                // 流量均值 m³/h（额定 100）
+  "avg_press_out": 0.312,           // 出口压力均值 MPa（额定 0.312）
+  "avg_press_in": 0.02,             // 入口压力均值 MPa（额定 0.020，过低有汽蚀风险）
+  "cv_flow": 0.51,                  // 流量变异系数 %（整段波动程度）
+  "cv_press": 0.59,                 // 出口压力变异系数 %
+
+  // —— 温度（3）——
+  "slope_temp_de": 1.529,           // 驱动端温度斜率 ℃/min ← 关键
+  "max_temp_de": 85.5,              // 驱动端温度峰值 ℃（70 预警 / 80 停机）← 关键
+  "max_temp_nde": 68.1,             // 非驱动端温度峰值 ℃
+
+  // —— 振动（3）——
+  "slope_vib_de": 0.208,            // 驱动端振动斜率 mm/s 每分钟 ← 关键
+  "max_vib_de": 5.12,               // 驱动端振动峰值 mm/s（3.5 上限 / 4.5 国标）← 关键
+  "max_vib_nde": 4.41,              // 非驱动端振动峰值 mm/s
+
+  // —— 电气（2）——
+  "avg_motor_current": 22.51,       // 电机电流均值 A（额定 22.5）
+  "max_motor_current": 23.08,       // 电机电流峰值 A（≥29 判满载跳闸）
+
+  // —— 2 分钟滑窗 CV 峰值（2）——
+  "cv_flow_peak": 0.62,             // 滑窗内流量 CV 峰值 %（捕"局部剧烈波动"）
+  "cv_press_peak": 0.69,            // 滑窗内出口压力 CV 峰值 %
+
+  // —— 拐点（1）——
+  "ramp_start_time": "2026-09-13T08:01:00",  // 温度 1min 滑窗斜率首次 ≥0.8 ℃/min 的时刻
+
+  // —— 状态（1）——
+  "state": "WARNING"                // 该段的状态标签
 }
 ```
 
----
-
-### 阶段 2c ｜`_judge_flags`：统计量 → 中文告警
-
-**输入是上面的统计量，输出 5 条**：
-
-```
-1. [DEGRADING段] 驱动端温度缓慢劣化 (斜率 0.75 ℃/min，黄色关注，约从 07:30:55 开始)
-2. [WARNING段]   驱动端温度超停机线 (max 85.5 ≥ 80℃)
-3. [WARNING段]   驱动端温度急剧恶化 (斜率 1.53 ℃/min ≥ 0.8，红色紧急，约从 08:01:00 开始)
-4. [WARNING段]   驱动端振动超国标停机线 (max 5.12 > 4.5 mm/s)
-5. [WARNING段]   非驱动端振动超良好区上限 (max 4.41 > 3.5 mm/s)
-```
-
-**看第 1 条和第 3 条**：同样是温度在升，DEGRADING 段斜率 0.75 判"缓慢劣化"，WARNING 段斜率 1.53 判"急剧恶化" —— 阈值 `0.2 / 0.8 ℃/min` 全部来自 `rules/thresholds.py`，代码里没有魔法数字。
+> **谁在用**：17 个渲染进大模型的 `phases_text`，16 个参与 `_judge_flags` 规则判定，
+> 两者重叠 12 个 —— **21 个全部有人读，没有一个是白算的**（有脚本可复核）。
+>
+> ★ 为什么只有**驱动端**有斜率（`slope_temp_de` / `slope_vib_de`）：
+> 非驱动端斜率的两个字段（原 `slope_temp_nde` / `slope_vib_nde`）全项目没有任何地方读，
+> 2026-09-17 删除；非驱动端仍保留峰值。同一天还删掉了 `inflection_time` /
+> `inflection_value`（"温度首次达到预警线的时刻与温度值"）—— 同样零读者，
+> 且"首次越预警线"已被 `max_temp_de` + 阈值判定覆盖。
+> 那次精简把每段 25 → **21** 个统计量。
 
 ---
 
-### 阶段 2d ｜两个通道取报警码
+### 阶段 1d ｜`_judge_flags`：统计量 → **规则码**
 
-**通道 A：从 `alarm_code` 列提取（SCADA 权威事实）**
-
-```
-effective_alarm_codes     = 'TAH-101;TAHH-101;VAH-102;VAHH-102'   ← 窗口内出现过（去重）
-last_alarm_codes          = 'TAHH-101;VAHH-102'                   ← 最后一次非 NONE 的组合
-all_alarm_codes_in_window = ['TAH-101','TAHH-101','VAH-102','VAHH-102']
-```
-
-**通道 B：`query_alarm_events` 取报警段（游程编码）**
+**判据一个字都没改，变的只是"输出什么形状"**（2026-09-20 起输出机器码）：
 
 ```
-TAH-101            | 08:00:05~08:02:40 | 持续155s | 温度(de)70.5→73.4℃(峰73.4) | 振动(de)2.84→3.12mm/s
-TAH-101;VAH-102    | 08:02:45~08:02:45 | 持续  0s | …
-TAH-101            | 08:02:50~08:04:15 | 持续 85s | …
-…（共 18 段）
-TAHH-101;VAHH-102  | 08:09:25~08:09:55 | 持续 30s | …
+窗口级（进 state 的 data.threshold_flags）—— 去重、按首次触发顺序
+['BEARING_TEMP_DE_RAMP_SLOW', 'BEARING_TEMP_DE_TRIP',
+ 'BEARING_TEMP_DE_RAMP_SHARP', 'VIB_DE_TRIP', 'VIB_NDE_WARN']
+
+段级（每个 phase 自带 rule_hits，"哪一段出了什么问题"一目了然）
+[DEGRADING段] ['BEARING_TEMP_DE_RAMP_SLOW']
+[WARNING段]   ['BEARING_TEMP_DE_TRIP', 'BEARING_TEMP_DE_RAMP_SHARP', 'VIB_DE_TRIP', 'VIB_NDE_WARN']
 ```
 
-> 对比一下：**同样这个窗口，改造前返回 118 条**（每一帧有报警的记录各一条）。
-> 现在 18 段 —— 因为一次连续报警只算一条，且带上了首末时间与持续时长。
+**中文事实句没有消失，只是挪到了"拼提示词的那一刻"**（`render_rule_hits`，只进 prompt、不进 state）：
+
+```
+- [DEGRADING段 07:30:00~08:00:00] 驱动端温度缓慢劣化（BEARING_TEMP_DE_RAMP_SLOW），约从 07:30:55 开始
+- [WARNING段 08:00:05~08:09:55] 驱动端温度超停机线（BEARING_TEMP_DE_TRIP）
+- [WARNING段 08:00:05~08:09:55] 驱动端温度急剧恶化（BEARING_TEMP_DE_RAMP_SHARP），约从 08:01:00 开始
+- [WARNING段 08:00:05~08:09:55] 驱动端振动超国标停机线（VIB_DE_TRIP）
+- [WARNING段 08:00:05~08:09:55] 非驱动端振动超良好区上限（VIB_NDE_WARN）
+```
+
+**为什么要这么分**：state 只留短而稳定的**码**（下游 Step 6 / 报告可直接吃，改文案不影响它们）；
+人读的中文只在提示词里生成一次。"约从 08:01:00 开始"这类上下文由码表的
+`extra_field` / `extra_template` 声明，渲染时现取——所以 `ramp_start_time` 依然有用。
+
+**看第 2 条和第 3 条**：同样是温度越线，走了两条不同判据 —— 温度绝对值（85.5 ≥ 80℃）与
+斜率（1.53 ℃/min ≥ 0.8），阈值全部来自 `rules/thresholds.py`，代码里没有魔法数字。
+码表 `RULE_CATALOG`（**17 条**）也放在同一个文件里，与 `_judge_flags` 的分支一一对应，
+有测试守着不许漂移（见 §5「加用例」前的防漂移说明）。
 
 ---
 
-### 阶段 2e ｜`overall` 全局概要
+### 阶段 1e ｜报警码：只认窗口数据
+
+```python
+# 从这一批帧的 alarm_code 列提取 → 去重排序
+effective_alarm_codes = 'TAH-101;TAHH-101;VAH-102;VAHH-102'
+```
+
+写进 `data.alarms` 三件套（`effective` / `last` / `all`）—— 这是报警码**唯一**的出处。
+（v1 里它还有两个兄弟字段 `last_alarm_codes` / `all_alarm_codes_in_window`，
+以及一份挂在顶层的重复副本，都已在 v2 删除。）
+
+---
+
+### 阶段 1f ｜`overall` 全局概要
 
 ```jsonc
 {"total_points":480, "start_state":"DEGRADING", "end_state":"WARNING",
  "has_shutdown":false, "phase_count":2,
+ "effective_alarm_codes":"TAH-101;TAHH-101;VAH-102;VAHH-102",
  "max_temp_de_overall":85.5, "max_vib_de_overall":5.12}
 ```
 
 ---
 
-### 阶段 3a ｜送进 Prompt 的四份材料
+### 阶段 2a ｜送进 Prompt 的三份材料
 
 | # | 材料 | 规模 | 内容 |
 | :---: | :--- | :--- | :--- |
-| ① | `overall_summary` | 8 行 | 点数 / 窗口 / 状态 / 峰值 |
+| ① | `overall_summary` | 9 行 | 点数 / 窗口 / 状态 / **窗口内出现过的报警码** / 峰值 |
 | ② | `phases_text` | 2 段 × 8 行 | 每段的指标表 |
-| ③ | `alarm_events_section` | 18 行 | 报警段（见 2d） |
-| ④ | `flags` | 5 条 | 阈值告警（见 2c） |
+| ③ | `flags` | 5 条 | 渲染后的规则事实（中文标签 + 码 + 段定位，见 1d） |
 
 **注意：送进去的全是算好的数字，没有一行原始遥测。**
 
 ---
 
-### 阶段 3b ｜大模型返回（经 Pydantic 校验）
+### 阶段 2b ｜大模型返回（经 Pydantic 校验）
+
+**1~6 条按 type 分类的数据现象描述**（A2 窗口实测：5 条，合计 407 字）：
 
 ```
-llm_description（约 570 字）:
-  07:30~08:00 设备处于 DEGRADING 段，流量约 100 m³/h、出口压力 0.312 MPa、
-  电机电流约 22.5 A 均保持平稳，驱动端温度以 0.75 ℃/min 缓慢爬升，至 08:00
-  前达 69.5 ℃……08:00:05 状态切换为 WARNING，触发 TAH-101（驱动端温度 70.5 ℃）……
-  至 08:09:55，驱动端温度达全程峰值 85.5 ℃（超 80 ℃ 停机线），
-  驱动端振动峰值 5.12 mm/s（超 4.5 mm/s 国标停机线）……
-
-basic_judgment（约 150 字）: 一段话概括关键异常时刻
-
-rag_search_queries: 3~5 条检索词
+[1] type=TREND       evidence=[slope_temp_de, max_temp_de, BEARING_TEMP_DE_RAMP_SLOW, …]
+    驱动端温度全程单调爬升，07:30 起缓慢劣化（slope≈0.75 ℃/min），08:00 后转为急剧恶化……
+[2] type=THRESHOLD   evidence=[max_temp_de, BEARING_TEMP_DE_TRIP]
+    驱动端温度越过停机线，命中 BEARING_TEMP_DE_TRIP，出现在 08:00:05~08:09:55 的 WARNING 段。
+[3] type=THRESHOLD   evidence=[max_vib_de, VIB_DE_TRIP, VIB_NDE_WARN]
+    驱动端振动越过国标停机线（峰值 5.12 mm/s），非驱动端振动同时越过良好区上限……
+[4] type=CORRELATION evidence=[slope_temp_de, slope_vib_de, …]
+    08:00 前后驱动端温度与驱动端振动同步加速上升……
+[5] type=OTHER       evidence=[avg_flow, cv_flow_peak]
+    流量与出口压力全程平稳（avg≈100 m³/h、0.312 MPa，CV<1%），未发生停机，窗口内无报警码。
 ```
 
-**关键点**：描述里的每个数字（100、0.312、22.5、0.75、69.5、85.5、5.12）**都能在阶段 2 的统计量里找到出处**。大模型做的是**翻译**，不是**计算**。
+**关键点**：描述里的每个数字都能在阶段 1 的统计量里找到出处；**`evidence` 里的名字也必须是材料里真实存在的**
+（节点侧有白名单过滤，大模型编造的名字会被丢掉）。大模型做的是**翻译**，不是**计算**。
+
+> ⚠️ 报警码只按"窗口内出现过"讲，**不能给它安时间** ——
+> 材料里没有单条报警码的起止时刻（见 §3.14），硬凑时间就是编造。
 
 ---
 
-### 阶段 4 ｜输出：12 个公共字段回流主图，2 个私有字段留下
+### 阶段 3 ｜输出：只回写 data 一个盒子
 
 ```
-子图 state 共 14 个键：
-  [公共] device_id / start_time / end_time / alarm_code
-  [公共] calculated_metrics        dict(2)    ← overall + phases
-  [公共] threshold_flags           list(5)
-  [公共] effective_alarm_codes     str(33)
-  [公共] last_alarm_codes          str(17)
-  [公共] all_alarm_codes_in_window list(4)
-  [公共] llm_description           str(~570)
-  [公共] basic_judgment            str(~150)
-  [公共] rag_search_queries        list(3~5)
+子图 state（= 公共契约 DiagnosisState，9 个盒子）：
+  [输入] state.context : trace_id / device_id / start_time / end_time / alarm_code / image_refs
+  [产出] state.data    : DataState
+           ├ telemetry_ref    取数来源（source / trace_id / 设备 / 窗口）
+           ├ quality          PENDING | OK | EMPTY | PARTIAL（+ total_points / reason）
+           ├ metrics          {"overall": {...}, "phases": [...]}
+           ├ threshold_flags  规则码（去重，按首次触发顺序）
+           ├ alarms           AlarmState{effective, last, all}
+           └ descriptions     list[DataDescription]（当前 1 条 type=OTHER，第 3 步改多条分类）
   ────────────────────────────────────────────
-  [私有] raw_telemetry_data        list(480)   ← 480 条原始遥测
-  [私有] alarm_events              list(18)    ← 18 段报警
-
-主图 state 收到 12 个键，全部属于公共契约: True
-私有字段是否外流: ✅ 否
+  没有私有字段：480 条原始遥测一条都没进 state
 ```
 
 ---
@@ -294,7 +368,7 @@ rag_search_queries: 3~5 条检索词
 
 24 小时窗口是 **17280 个点**。无论给大模型还是给下游 Step，逐帧数据都没有意义 —— 有价值的是"**它经历了哪几个阶段、每个阶段什么样**"。
 
-分段就是**降维的第一步**：17280 点 → 10 段，然后每段只用 25 个统计量代表。
+分段就是**降维的第一步**：17280 点 → 10 段，然后每段只用 21 个统计量代表。
 
 ### 3.2 为什么按 `operating_state` 分段，而不是按数值突变点？
 
@@ -321,8 +395,8 @@ ACTIVE_STATES = frozenset({"NORMAL", "DEGRADING", "WARNING",
 
 **停机是故障的结果，不是新的异常源。** 跳过它是刻意的。
 
-实测这道闸门确实拦住了东西 —— 停机段（08:10~10:29）的滑窗 CV 峰值是 **464.95%**，
-远超 12% 的流态失稳判据。若不排除，这里会凭空报出"疑似气蚀脱流"。
+实测这道闸门确实拦住了东西 —— 停机段的滑窗 CV 峰值是 **464.95%**，
+远超 12% 的 CV 判据。若不排除，这里会凭空报出"波动超离散度阈值"。
 
 > **这里有第二道、且不依赖标签的闸门**：`FLOW_ACTIVE_THRESHOLD_M3H = 20.0`。
 > 流量低于 20 m³/h 直接视为停机段，不参与流量偏离 / CV 告警 —— 这道判据只看物理量。
@@ -349,13 +423,11 @@ ACTIVE_STATES = frozenset({"NORMAL", "DEGRADING", "WARNING",
 
 - 字段名写错 → 当场报错
 - 类型不对 → 当场报错
-- 回写了未声明的键 → 当场报错
+- 回写了未声明的键 → 当场报错（v2 删掉私有字段后，这条还顺带保证了节点不会偷偷往 state 里塞大数据）
 
 **代价**：LangGraph 传给节点的是**模型实例不是 dict**，所以 `DiagnosisState` 上补了下标访问协议（`__getitem__`），让原有节点代码一行都不用改。
 
-### 3.6 为什么子图 state 要**继承**公共契约？
-
-**实测结论**（langgraph 1.2.11）：
+### 3.6 子图 state 与公共契约的关系（langgraph 1.2.11 实测）
 
 | 规则 | 含义 |
 | :--- | :--- |
@@ -365,84 +437,46 @@ ACTIVE_STATES = frozenset({"NORMAL", "DEGRADING", "WARNING",
 
 所以**不能"子图只定义私有字段"** —— 那样子图连 `device_id` 都读不到（实测确认）。
 
-正确做法是继承：公共字段**一处定义**，私有字段只加在子图。结果就是主图干净地拿到 12 个公共字段，480 条原始数据一条都没漏出去。
+**Step 2 当前的做法**：因为已经没有任何私有字段，子图直接拿公共契约
+`DiagnosisState` 当 state，`data_state.py` 随之删除。
+将来哪个子 Agent 真的需要私有字段，就按"**继承公共契约 + 补私有字段**"扩展。
 
-> **但"私有 ≠ 免费"**：私有字段虽然不外流，**仍然留在子图 state 里**，子图内部每走一步照样要合并一次。要彻底消除只能让它根本不进 state —— 那是后续优化项。
+> **"私有 ≠ 免费"**：私有字段虽然不外流，**仍然留在子图 state 里**，
+> 子图内部每走一步照样要被合并一次。这就是 v2 把取数与计算合并、让原始帧
+> 走函数局部变量的原因（§3.15）。
 
 ### 3.7 为什么取数函数不用 `@tool` 装饰器？
 
 `@tool` 是**给大模型绑定工具**用的（让 LLM 决定何时调用）。
 
-而 `query_scada_telemetry` / `query_alarm_events` 是**节点里的固定步骤**，由 Python 代码直接调用，大模型根本决定不了。给它们套 `@tool` 只会：
+而 `query_scada_telemetry` 是**节点里的固定步骤**，由 Python 代码直接调用，大模型根本决定不了。给它套 `@tool` 只会：
 
 - 让调用方式变成 `xxx.invoke({...})`（多一层没必要的包装）
 - 让人误以为"这是给 LLM 用的工具"
 
-现在它们是普通函数，直接 `query_scada_telemetry(device_id, start, end)` 调用。
+### 3.8 为什么报警码要"两个来源"？现在为什么只剩一个？
 
-### 3.8 为什么报警事件要做**游程编码**？
+v1 里报警码有两条通道：
 
-`query_alarm_events` 的用途是「**查看报警发生时设备的状态**」。
+| 通道 | 来源 | 特点 |
+| :--- | :--- | :--- |
+| 报警事实 | SCADA 的 `alarm_code` 列 | 权威 —— SCADA 已按持续时长确认过 |
+| 规则求值 | `_judge_flags` 扫统计量 | 补盲 —— 能发现 SCADA 没报的越限 |
 
-而 5 秒采样下，同一个报警码会**连续出现几十上百帧**。如果每帧存一条：
+**v2 把它收敛成一条线**：报警码只从窗口数据提取（`overall.effective_alarm_codes`），
+`_judge_flags` 继续负责"报警表没列的判据"：两端振动差异、流量偏离额定值、
+**出口压力偏离额定值**、CV 离散度、入口压力。
 
-| 窗口 | 每帧一条（旧） | 每次报警一段（新） |
-| :--- | :---: | :---: |
-| A2（10 分钟） | 118 条 | **18 段** |
-| 24 小时 | 421 条 | **30 段** |
+理由：SCADA 的 `alarm_code` 本来就是用**同一批阈值**算出来的
+（`scripts/scada_generator.py` 的 80/70/4.5/3.5/85/-0.040/29/15 与 `rules/thresholds.py` 同源），
+两套"越限事实"高度重叠；而 `_judge_flags` 独有的那部分（带实测值与阈值、可溯源）才是它不可替代的价值。
 
-而且旧的形态**丢掉了最关键的信息**：这个报警持续了多久？
-
-新形态每条带：`报警码 | 首末时间 | 持续时长 | 起始/结束状态 | 温度与振动的起止值和峰值 | 流量`。
-
-**"TAH-101 从 08:00:05 持续到 08:02:40，期间温度从 70.5 升到 73.4℃"** —— 这才回答了"这次报警意味着什么"。
-
-### 3.9 为什么还要**去抖**？
-
-因为报警码会闪：
-
-```
-08:00:05  TAH-101     ← 报
-08:00:10  NONE        ← 掉（温度在阈值上下抖）
-08:00:15  TAH-101     ← 又报
-```
-
-不去抖的话，**一次持续 155 秒的报警会被切成两条**："1 帧的段 + 145 秒的段"，既看不出真实持续时间，又白占一条记录。
-
-所以加了容忍度：相邻同码报警间隔 ≤ `ALARM_GAP_TOLERANCE_SEC`（10 秒 = 2 个采样周期）时视为**同一次**。合并后就是干净的 `08:00:05~08:02:40 持续 155s`。
-
-### 3.10 为什么要**上限保护**？
-
-报警码在阈值附近疯狂抖动时（比如 B2/B4S 那种碎片场景），可能产生上百段。不加限制会把 state 和提示词一起撑爆。
-
-`MAX_ALARM_RUNS = 30`：超出时**按持续时长降序保留最长的**（抖动产生的短段信息量最低），其余**折叠成一条摘要**而不是静默丢弃：
-
-```
-[（折叠）] 另有 5 段短促报警未逐条列出（均为单帧触发）
-```
-
-### 3.11 为什么描述长度预警线按**事件数**算？
-
-原先的规则是 `≤5 段 → 500 字；>5 段 → 1000 字`。
-
-**问题**：A2 这个窗口只有 2 段，但**报警码升级了 18 次**，事件一点不少，却被 500 字卡住（实测写 545~650 字，一直被误报）。
-
-**改成按事件数**：
-
-```python
-warn_threshold = min(1000, 500 + 40 × 状态切换次数 + 10 × 报警段数)
-```
-
-事件数才是"这段窗口里发生了多少事"的直接度量。A2 得 720、24h 得 1000，都按实测**上沿**留了余量。
-
-> 另外说明：这条只是**软预警**（打印一句提醒），不影响测试通过。它的作用是提示开发者"描述是否没做好同类项合并"。
-
-### 3.12 为什么 `temperature=0`、`max_tokens=4096`？
+### 3.9 为什么 `temperature=0`、`max_tokens=4096`？
 
 - **`temperature=0`**：工业诊断要求"同一窗口、同一数据、同一结论"。0.7 会让同一窗口的描述长度在 765~1031 字之间乱跳，**字数断言必然时好时坏**。（实测：改成 0 后波动收窄到 ±50 字）
-- **`max_tokens=4096`**：原来是 1024。结构化输出要把 JSON 骨架 + 正文一起塞进这个额度，**19 个阶段的密集故障窗口会超出被截断**，`with_structured_output` 解析失败返回 `None`，节点直接崩。改成 4096 后解决。
+- **`max_tokens=4096`**：原来是 1024。结构化输出要把 JSON 骨架 + 正文一起塞进这个额度，**密集故障窗口会超出被截断**，`with_structured_output` 解析失败返回 `None`，节点直接崩。改成 4096 后解决。
 
-### 3.13 为什么 Prompt 里不写 JSON 格式？
+### 3.10 为什么 Prompt 里不写 JSON 格式？
 
 因为用了 `with_structured_output(SemanticizeOutput)` —— **schema 由 LangChain 自动注入**。
 
@@ -450,16 +484,111 @@ warn_threshold = min(1000, 500 + 40 × 状态切换次数 + 10 × 报警段数)
 
 同时这也带来了强约束：LLM 漏字段、类型写错，**直接抛 `ValidationError`**，而不是像 `JsonOutputParser` 那样静默返回脏数据。
 
-### 3.14 为什么报警码要"双通道"？
+### 3.11 为什么 `descriptions` 是 1~6 条，而不是一段话？
 
-| 通道 | 来源 | 特点 |
+组长的契约把 Step 2 的语义化产出定义成 `data.descriptions: list[DataDescription]`
+（每条 `{type, description, evidence}`），所以这里**不是**"一段 llm_description"：
+
+- **按类型分条**，下游才能按需取用（Step 4 RAG 检索、Step 7 报告分节）；
+  一段整话既没法检索、也没法按类别筛选。
+- **type 六选一**（TREND / ANOMALY / THRESHOLD / CORRELATION / ALARM / OTHER），
+  由 Pydantic 的 `Literal` 钉死 —— 大模型写错类别直接 ValidationError。
+- **条数 1~6**：上限定 6 是防大模型"刷条数"把描述拆成流水账；下限定 1 是要求
+  即使全窗口平稳也必须给出结论，不能返回空列表。
+- **evidence 必须能回溯**：节点侧拿"材料里真实出现过的指标名 + 规则码"做白名单，
+  把编造的（如 `bearing_temperature`）过滤掉再写进 state。
+
+> v1 的另两个字段（`basic_judgment` / `rag_search_queries`）仍然没有回来：
+> 前者与描述重叠，后者是 Step 4 的活；组长的契约里也没有它们。
+
+### 3.12 为什么描述长度预警线按**事件数**算？
+
+原先的规则是 `≤5 段 → 500 字；>5 段 → 1000 字`。问题是 A2 这种窗口段数少、事件却不少，会被误报。
+
+**改成按事件数**。v1 用的是「状态切换次数 + 报警段数」；报警事件查询删掉后，
+"报警段数"没有了，改用**窗口内出现的报警码种数**作为"有多少种报警在响"的近似度量：
+
+```python
+warn_threshold = min(1000, 500 + 40 × 状态切换次数 + 20 × 报警码种数)
+```
+
+> 这条只是**软预警**（打印一句提醒），不影响任何断言。真实跑批后可再按实测调。
+
+### 3.13 为什么 `summarize` 节点要显式处理"解析失败返回 None"？
+
+`with_structured_output` 在解析失败时返回 `None`（最常见原因是输出被 `max_tokens` 截断）。
+如果不处理，下游会在访问返回值的某个字段时抛出莫名其妙的 `'NoneType' object has no attribute ...`。
+所以节点里显式检查并给出一句能直接定位问题的报错。
+
+### 3.14 ★ 为什么删掉报警事件查询（`query_alarm_events`）？
+
+它原本在 `summarize` 节点里**把同一个窗口的行再查一遍库**，产出"一次连续报警 = 一条"
+的游程编码（带首末时间、持续时长、报警时设备状态、段内峰值），再渲染成 prompt 材料。
+
+删掉的理由：
+
+1. **信息几乎全部重复**：它要的那批行，`analyze` 节点刚取过一遍。同一个窗口查两次库，
+   24h 窗口就是白白多扫 1.7 万行。
+2. **它的唯一读者已经不需要它**：报警段的"持续多久"这条信息，`phases`（按
+   `operating_state` 分的状态段）已经近似回答了 —— 而 `operating_state` 本来就是由
+   `alarm_code` 反推的。所以"有报警的那段时间从哪到哪、期间温度振动爬到多少"这条线还在，
+   只是粒度从"单条报警码"变成"状态段"。
+3. **连带省掉一整套防御代码**：游程编码、10s 去抖、30 段上限保护，约 150 行。
+
+**代价（必须记住）**：大模型不再知道**单条报警码的精确起止时刻与持续时长**。
+所以提示词里原来那句"状态切换时刻必须提及：写出切换时间**与触发的报警码**"
+已拆成两句话 —— 否则大模型会把报警码硬凑到某个时间点上（那就是幻觉）。
+
+### 3.15 ★ 为什么取数和确定性计算要合成一个节点？
+
+v1 是 `fetch_data` → `calculate_metrics` → `semanticize` 三节点，
+取回的数据必须写进 state 才能交给下一个节点，于是 24h 窗口的 **1.7 万条原始遥测
+每走一步都要被合并拷贝一次**（v1 的 §6 已知边界 #5 就记着这件事）。
+
+合并成一个 `analyze` 节点后，原始帧只是**函数局部变量**，返回时只交出压缩后的小结果：
+
+| | v1 | v2 |
 | :--- | :--- | :--- |
-| **报警事实** | SCADA 的 `alarm_code` 列 | **权威** —— SCADA 已按持续时长确认过 |
-| **规则求值** | `_judge_flags` 扫统计量 | **补盲** —— 能发现 SCADA 没报的越限 |
+| 节点 | 3 | **2** |
+| 私有字段 | 2（1.7 万条帧 + 18 段报警） | **0** |
+| 每窗口数据库查询 | 2 次 | **1 次** |
+| Step 2 产出公共字段 | 8 | **3** |
 
-两者**取并集**：宁可提示，不可漏报。
+### 3.16 ★ 为什么报警码不再读用户入参的 `alarm_code`？
 
-E 组用例专门验证这两个通道：E1 有入参+窗口内有、E2 有入参+窗口内无（回退到入参）、E3 无入参+窗口内有（自行提取）、E4 停机后清零。
+一个数据只能有一个真相来源。v1 里 `alarm_code` 入参是"窗口内没有任何报警帧时的兜底"，
+结果是同一次分析可能给出两种报警码（数据里的 vs 用户嘴里的）。
+
+v2 起 Step 2 **完全不读** `alarm_code`：窗口里没有报警就是 `NONE`。
+
+> 字段本身**还留在公共契约里** —— Step 3 的视觉提示词仍在用它
+> （`vision_client.py` 的 `alarm_code` 占位符）。
+> 将来若要让它也改读 Step 2 的产出，是 Step 3 那边的独立改动。
+
+### 3.17 ★ 出口压力偏离判据（2026-09-17 补全的"半成品判据"）
+
+`rules/thresholds.py` 早就定义了 `DEV_PRESS_PCT = 20.0`（规范 5.1：`|Dev_press| > 20%` → 水力压头异常），
+但 `_judge_flags` 一直没实现它 —— 全项目只有一条测试断言引用过这个常量。现已补上：
+
+```python
+dev_press = (ph["avg_press_out"] - RATED_PRESS_OUT_MPA) / RATED_PRESS_OUT_MPA * 100
+if abs(dev_press) > DEV_PRESS_PCT:
+    flags.append(f"{tag} 出口压力工况偏离额定值 >{DEV_PRESS_PCT:g}% (实际 {dev_press:+.1f}%)")
+```
+
+**它跟流量判据共用同一道闸门**（`avg_flow > FLOW_ACTIVE_THRESHOLD_M3H = 20`）。
+为什么必须加这道闸门，实测数据一目了然：
+
+| 段 | avg_flow | avg_press_out | 压头偏离 | 结论 |
+| :--- | ---: | ---: | ---: | :--- |
+| 重启欠载段（泵在转） | 42 m³/h | 0.131 MPa | **-58%** | ✅ 报 —— 真阳性，扬程只有额定的 42% |
+| 停机后刚重启的瞬间 | 0.9 m³/h | 0.005 MPa | -98% | ❌ 不报 —— 流动还没建立，压力低是必然 |
+| 停机段 | 0.04 m³/h | 0.001 MPa | -99% | ❌ 不报 —— 本来就被 `ACTIVE_STATES` 白名单排除 |
+
+⚠ 在当前数据集里这条判据**只在重启欠载段触发**，其余时间出口压力紧贴额定的 0.312 MPa。
+防护：B3 / C5 两个"重启过渡"用例加了 `alarm_contains: ["PRESS_OUT_DEV"]`，
+另有一条**不依赖数据库**的单测（`test_pressure_deviation_rule_fires_and_shares_the_flow_gate`）
+同时验证"要报"与"被闸门挡住"两种情况。
 
 ---
 
@@ -475,7 +604,7 @@ E 组用例专门验证这两个通道：E1 有入参+窗口内有、E2 有入�
 | **B 故障形态**（7） | B1~B5, B4S, E5S | 高温越线、阈值抖动、重启欠载、24h 真实密度、高碎片密度 |
 | **C 窗口边界**（6） | C1~C6 | 单点 / 两点 / 1 分钟 / 停机段 / 启动过渡 / **未知设备降级** |
 | **D 数据一致性**（4） | D1~D4 | 三个历史数据 Bug 的守护 + 跨状态边界切段 |
-| **E 报警码双通道**（5） | E1~E5 | 入参与窗口内报警的各种组合 |
+| **E 报警码来源**（5） | E1~E5 | 报警码只认窗口数据；入参不再被采用 |
 | **G 状态机**（2） | G1, G2 | 无切换 / 多状态切换 |
 | **H 碎片**（2） | H1, H2 | 切段粒度在碎片场景下的表现 |
 
@@ -486,8 +615,8 @@ E 组用例专门验证这两个通道：E1 有入参+窗口内有、E2 有入�
 窗口 2026-09-13T07:30:00 ~ 08:09:55
 期望 points=480, phases=2, alarm_count≥4
      states_contains=[DEGRADING, WARNING]
-     last_alarm_codes='TAHH-101;VAHH-102'
-     alarm_contains=[温度超停机线, 温度急剧恶化, 振动超国标]
+     effective_alarm_codes_contains=[TAH-101, TAHH-101, VAH-102, VAHH-102]
+     alarm_contains=[BEARING_TEMP_DE_TRIP, BEARING_TEMP_DE_RAMP_SHARP, VIB_DE_TRIP]
 ```
 
 **② H1 —— 碎片切分**（暴露"按状态切段"的粒度问题）
@@ -498,12 +627,12 @@ E 组用例专门验证这两个通道：E1 有入参+窗口内有、E2 有入�
 这是"按 `operating_state` 切段"的**直接后果** —— 数值在阈值附近抖动时，
 状态会频繁翻转，产生大量极短段。用例把它**固定成已知行为**，而不是假装不存在。
 
-**③ C6 —— 未知设备降级**
+**③ E2 —— 入参不再被采用**（v2 的行为变更）
 ```
-device_id = "PUMP-UNKNOWN"（库里没有）
-期望 points=0, phases=0, alarm_count=1, alarm_contains=["无数据"]
+窗口 T1 开机后纯 NORMAL 段（60 点），入参 alarm_code = "TAHH-101;VAHH-102"
+期望 effective_alarm_codes = "NONE"
 ```
-验证"窗口无数据是**正常响应**而不是异常"：节点返回结构完整的空结果 + 一条"无数据"告警，**不抛异常**。
+窗口里没有报警就是 NONE —— 报警码只有一个真相来源（见 §3.16）。
 
 ---
 
@@ -515,34 +644,40 @@ device_id = "PUMP-UNKNOWN"（库里没有）
 ```python
 ("A2", "完整故障周期（DEGRADING→WARNING）",   # ① 用例 ID  ② 名称
  DEV, T1_DEG_START, T1_WARN_END,              # ③ 设备位号  ④ 起始  ⑤ 结束
- "",                                          # ⑥ 入参 alarm_code（可空）
+ "",                                          # ⑥ 入参 alarm_code（Step 2 已不读，仅兼容签名）
  {"points": 480,                              # ⑦ 期望值字典
   "phases_min": 2, "phases_max": 3,
   "states_contains": ["DEGRADING", "WARNING"],
   "alarm_count_min": 4,
   "effective_alarm_codes_contains": ["TAH-101", "TAHH-101", "VAH-102", "VAHH-102"],
-  "last_alarm_codes": "TAHH-101;VAHH-102",
-  "alarm_contains": ["温度超停机线", "温度急剧恶化", "振动超国标"],
+  "alarm_contains": ["BEARING_TEMP_DE_TRIP", "BEARING_TEMP_DE_RAMP_SHARP", "VIB_DE_TRIP"],
   "note": "温度 45→85.5℃ 越停机线，振动最高 5.12mm/s 越国标"}),
 ```
 
-### 支持的期望字段（共 21 个，全部可选，缺省即不校验）
+### 支持的期望字段（全部可选，缺省即不校验）
 
 | 类别 | 字段 | 含义 |
 | :--- | :--- | :--- |
 | **精确** | `points` / `phases` / `alarm_count` / `states` | 完全相等 |
 | **范围** | `points_min` / `points_max` / `phases_min` / `phases_max` | 上下界 |
-| | `alarm_count_min` | 告警条数下界（**只有 `_min`，没有 `_max`**） |
+| | `alarm_count_min` | **去重后规则码种数**的下界（**只有 `_min`，没有 `_max`**） |
 | | `max_desc_len` / `min_desc_len` | LLM 描述字数区间 |
 | **状态** | `states_contains` | **按序**子序列 |
 | | `states_set_contains` | **无序**集合 |
-| **报警码** | `effective_alarm_codes` | 精确匹配 |
+| **报警码** | `effective_alarm_codes` | 精确匹配（取自 `data.alarms.effective`） |
 | | `effective_alarm_codes_contains` / `..._excludes` | 包含 / 排除 |
-| | `last_alarm_codes` | 最后一次非 NONE 的组合 |
-| **告警文本** | `alarm_contains` / `alarm_excludes` | 子串包含 / 排除 |
-| **其他** | `has_alarm` | 是否有告警（等价 `alarm_count > 0`） |
+| **规则码** | `alarm_contains` / `alarm_excludes` | 规则码子串包含 / 排除（★ 2026-09-20 起比对的是机器码，不再是中文句） |
+| | `no_rule_hits_on_states` | 这些**状态**的段上不许有任何规则命中（替代原来的 `alarm_excludes: ["[NORMAL段]"]`） |
+| **数据质量** | `quality_status` | `data.quality.status` 精确匹配（OK / EMPTY / PENDING / PARTIAL） |
+| | `quality_reason_contains` | `data.quality.reason` 子串包含（降级原因就写在这儿） |
+| **其他** | `has_alarm` | 是否有规则命中（等价 `alarm_count > 0`） |
 | | `expect_data_bug` | 历史数据 Bug 是否已修 |
 | | `note` | 说明，不参与校验 |
+
+> v2 删除了 `last_alarm_codes` 这个期望字段（对应公共字段已从契约删除）。
+> `alarm_count` 的口径也变了：从"告警行数"改为**去重后的规则码种数** ——
+> 所以 B2 / B4S 这两个 56 段的抖动窗口从 5 降到了 **1**（始终只有 `FLOW_DEV` 一种码），
+> 这不是漏报，是去重。
 
 ### 加用例的步骤
 
@@ -556,7 +691,7 @@ device_id = "PUMP-UNKNOWN"（库里没有）
 3. 跑 `python -m tests.test_pipeline`，看实际值对不对得上
 
 > **断言口径：绑物理量，不绑数据指纹。**
-> ✅ `states_contains=["DEGRADING","WARNING"]`、`alarm_contains=["温度超停机线"]`、
+> ✅ `states_contains=["DEGRADING","WARNING"]`、`alarm_contains=["BEARING_TEMP_DE_TRIP"]`、
 > `max_desc_len=900`、`effective_alarm_codes_contains=["TAHH-101"]`
 > ❌ 绑死在某个窗口恰好切出几段、恰好有多少点
 >
@@ -574,9 +709,12 @@ device_id = "PUMP-UNKNOWN"（库里没有）
 | 1 | **分段依赖 SCADA 状态标签** | 标签缺失/标错时，**分段**与"停机段跳过"都会错，且**不报错**（静默产出零告警） | 当前数据集的 `operating_state` 可靠。缓解：告警判定另有 `FLOW_ACTIVE_THRESHOLD_M3H=20` 这道**只看物理量**的闸门。长期应增加"标签与数值不一致"的核验告警 |
 | 2 | **按状态切段会产生碎片** | 数值在阈值附近抖动时切成大量极短段（H1：7 点 4 段） | 已用 H1/H2 固定为已知行为；告警判定按段进行，碎片会让同一条告警重复出现 |
 | 3 | **当前数据集缺两类故障场景** | 不含 `CRITICAL_CAVITATION`（气蚀）与 `UNBALANCE_MISALIGNMENT`（动不平衡），也没有 `PAL-103`（入口压力低） | 四大故障类型只覆盖了密封泄漏一条线；原 B1/B2/B3 用例已改用等效窗口，`note` 里注明。**要恢复覆盖需生成含相应场景的数据集** |
-| 4 | **CV 判据分不清"爬坡"与"高频波动"** | 重启时流量从 0 爬升，2 分钟滑窗内被算成高频波动 → **误报"疑似流态失稳"**。实测：T1 重启段 `CV_flow_peak=82.3%`、T2 重启段 `88.6%`（判据 12%） | **确认为已知误报**（重启段状态是 WARNING，在白名单内，挡不住）。停机段更极端（`464.95%`）但被白名单排除。根治需先**去趋势**再算 CV |
-| 5 | **私有字段仍占子图 state** | `raw_telemetry_data`（24h 达 1.7 万条）虽不外流，但子图内部每步仍要合并拷贝 | 彻底解决需让取数与计算合并成一个节点、数据走函数局部变量 |
+| 4 | **CV 判据分不清"爬坡"与"高频波动"** | 重启时流量从 0 爬升，2 分钟滑窗内被算成高频波动 → **误报"波动超离散度阈值"**。实测：T1 重启段 `CV_flow_peak=82.3%`、T2 重启段 `88.6%`（判据 12%） | **确认为已知误报**（重启段状态是 WARNING，在白名单内，挡不住）。停机段更极端（`464.95%`）但被白名单排除。根治需先**去趋势**再算 CV |
+| 5 | **单条报警码的时序不再进 prompt** | 大模型只知道"窗口内出现过哪些报警码"，不知道每个码什么时候开始、持续多久 | v2 删掉报警事件查询的代价（§3.14）。需要精确时序时应从 `phases`（状态段起止）近似，或另外生成含报警时序的数据集 |
 | 6 | **描述长度有大模型固有波动** | 同一窗口多次调用相差 ±50 字（`temperature=0` 也不能完全消除） | 字数断言已按实测上沿留余量 |
+| 7 | **没有大模型 Key 就建不起图** | `data_nodes.py` 模块导入时就构造 LLM 客户端 → `pytest` 里涉及建图的用例只能 skip | 已知；改成节点内惰性构造可以根治，但那要连带改 Step 3 的导入方式，留待后续 |
+| 8 | **Step 3 还没适配 9 盒子契约** | `vision_node` 仍按旧的扁平字段读写（`state.get("image_refs")`），在真实的 `DiagnosisState` 上会 `AttributeError`；`tests/test_vision_agent.py` 有 2 条 FAILED | 本轮范围外（用户决定 Step 3 推后）。Step 2 自身全绿：`tests/test_nodes.py` 27 passed + 端到端 30/30 |
+| 9 | **本地 `src/orchestrator/graph.py` 还是旧主图** | 它仍挂着旧的 `vision_node`，跑起来会在 Step 3 崩；`build_diagnosis_graph`（组长的新主图）还没合过来 | 主图整合由组长走 PR；Step 2 的挂载用测试里的迷你父图验证（`test_mini_parent_graph_*`） |
 
 ---
 
@@ -584,6 +722,9 @@ device_id = "PUMP-UNKNOWN"（库里没有）
 
 > **Python 负责"算什么"，大模型只负责"怎么说"。**
 >
-> 数据从 480 条原始遥测 → 2 个状态段 → 50 个统计量 → 5 条规则告警 → 18 段报警
+> 数据从 480 条原始遥测 → 2 个状态段 → 50 个统计量 → 5 条规则事实 → 4 个报警码
 > → 一路降维，最后只把"算好的数字"交给大模型翻译成一段话。
 > 大模型**碰不到原始数据**，也**写不出错数字**（它拿到的输入里根本没有可算的东西）。
+>
+> 而这一版做的事是：**让"接口"和"工序"也一起降维** ——
+> 3 节点 → 2 节点、产出字段 8 → 3、私有字段 2 → 0、查库 2 次 → 1 次。

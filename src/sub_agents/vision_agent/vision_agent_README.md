@@ -525,15 +525,17 @@ monkeypatch 记录模型收到的 ocr_text
 
 | 节点 | 必须有 | 可选 | 缺"必须有"时的行为 |
 | :--- | :--- | :--- | :--- |
-| **Step 2** `data_agent`（子图） | `device_id` + `start_time` + `end_time` | `alarm_code` | ✅ **软降级**：不查库、不计算、不调大模型，返回空结果 + 告警 `未提供时间窗口：本次未做时序分析` |
+| **Step 2** `data_agent`（子图） | `device_id` + `start_time` + `end_time` | 无（★ 2026-09-17 起 Step 2 **不再读** `alarm_code`，报警码一律取自窗口数据） | ✅ **软降级**：不查库、不计算、不调大模型，返回空结果 + 告警 `未提供时间窗口：本次未做时序分析` |
 | **Step 3** `vision_node`（节点函数） | `image_refs`（非空且可读） | `device_id`、`alarm_code` | ✅ 空清单 → 零成本短路（形状恒定）；单张坏图 → 该图失败占位 |
 
 两者读的都是 A 类字段，写的键**完全不重叠**：
 
 ```
-Step 2 写：calculated_metrics / threshold_flags / effective_alarm_codes /
-          last_alarm_codes / all_alarm_codes_in_window /
-          llm_description / basic_judgment / rag_search_queries
+Step 2 写：calculated_metrics / threshold_flags / llm_description
+          （★ 2026-09-17 精简：effective_alarm_codes / last_alarm_codes /
+            all_alarm_codes_in_window / basic_judgment / rag_search_queries
+            五个字段已从公共契约删除；窗口内出现过的报警码改为
+            calculated_metrics.overall.effective_alarm_codes）
 Step 3 写：image_refs（清洗后）/ visual_description / visual_findings
 ```
 
