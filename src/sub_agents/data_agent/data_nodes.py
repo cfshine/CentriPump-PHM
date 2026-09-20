@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 
+from rules.thresholds import DATA_COVERAGE_MIN_PCT, SAMPLE_INTERVAL_SEC
 from src.schemas.state import (
     AlarmState,
     DataDescription,
@@ -23,7 +24,7 @@ from src.schemas.state import (
     TelemetryRef,
 )
 from src.sub_agents.data_agent.analyzer import _judge_flags, _segment_metrics
-from src.sub_agents.data_agent.data_tools import query_scada_telemetry
+from src.sub_agents.data_agent.data_tools import _parse_ts, query_scada_telemetry
 from src.sub_agents.data_agent.timeseries_tools import (
     _extract_alarm_codes,
     _format_overall,
@@ -206,13 +207,27 @@ def analyze_node(state: DiagnosisState) -> dict:
         "max_vib_nde_overall": _py(df['vib_rms_nde'].max(), 2),
     }
 
+    # —— 5. 数据完整性：窗口里本该有多少点 vs 实际拿到多少点 ——
+    window_sec = (_parse_ts(ctx.end_time) - _parse_ts(ctx.start_time)).total_seconds()
+    expected_points = int(window_sec // SAMPLE_INTERVAL_SEC) + 1
+    coverage_pct = len(df) / expected_points * 100 if expected_points > 0 else 100.0
+    if coverage_pct < DATA_COVERAGE_MIN_PCT:
+        quality = DataQuality(
+            status="PARTIAL", total_points=int(len(df)),
+            reason=f"窗口内缺失约 {100 - coverage_pct:.0f}% 的数据"
+                   f"（理论 {expected_points} 点，实际 {len(df)} 点）",
+        )
+    else:
+        quality = DataQuality(status="OK", total_points=int(len(df)), reason="")
+
     print(f"[analyze] 识别 {len(phases)} 个阶段，命中 {len(rule_codes)} 种规则: {rule_codes}")
     print(f"[analyze] 窗口内报警码: {effective}")
+    print(f"[analyze] 数据质量: {quality.status}（覆盖率 {coverage_pct:.0f}%）")
 
     return _data_update(
         state,
         telemetry_ref=telemetry_ref,
-        quality=DataQuality(status="OK", total_points=int(len(df)), reason=""),
+        quality=quality,
         metrics={"overall": overall, "phases": phases},
         threshold_flags=rule_codes,
         alarms=AlarmState(effective=effective, last=last, all=all_codes),

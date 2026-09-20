@@ -19,3 +19,6 @@ test_run*.log
 data/manuals/*
 !data/manuals/.gitkeep
 !data/sample_inputs/.gitkeep
+
+# ---- 本地测试（有意不入库，2026-09-20 用户决定）----
+tests/

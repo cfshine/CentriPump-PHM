@@ -123,6 +123,17 @@ ACTIVE_STATES: Final[frozenset[str]] = frozenset({
     "CRITICAL_CAVITATION", "UNBALANCE_MISALIGNMENT",
 })
 
+# =============================================================================
+# 四之二、数据完整性判据（用于 DataQuality.status = "PARTIAL"）
+# =============================================================================
+
+# SCADA 采样周期（秒）。现有数据集是 5s 一个点。
+SAMPLE_INTERVAL_SEC: Final[int] = 5
+
+# 数据覆盖率下限（%）。窗口内实际点数低于"理论点数 × 此比例"即判数据不完整。
+# 依据：缺个把点是正常的，缺成片就该让下游（Step 6 安全门禁）知道这份分析不可全信。
+DATA_COVERAGE_MIN_PCT: Final[float] = 90.0
+
 # 阈值档案标识：写入报告供溯源（改阈值务必同步改版本号）
 THRESHOLD_PROFILE_ID: Final[str] = "SCADA-SPEC-2026-V1 + GB50275-2010"
 
