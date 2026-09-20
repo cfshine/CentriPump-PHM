@@ -123,5 +123,67 @@ ACTIVE_STATES: Final[frozenset[str]] = frozenset({
     "CRITICAL_CAVITATION", "UNBALANCE_MISALIGNMENT",
 })
 
+# =============================================================================
+# 四之二、数据完整性判据（用于 DataQuality.status = "PARTIAL"）
+# =============================================================================
+
+# SCADA 采样周期（秒）。现有数据集是 5s 一个点。
+SAMPLE_INTERVAL_SEC: Final[int] = 5
+
+# 数据覆盖率下限（%）。窗口内实际点数低于"理论点数 × 此比例"即判数据不完整。
+# 依据：缺个把点是正常的，缺成片就该让下游（Step 6 安全门禁）知道这份分析不可全信。
+DATA_COVERAGE_MIN_PCT: Final[float] = 90.0
+
 # 阈值档案标识：写入报告供溯源（改阈值务必同步改版本号）
 THRESHOLD_PROFILE_ID: Final[str] = "SCADA-SPEC-2026-V1 + GB50275-2010"
+
+
+# =============================================================================
+# 五、规则码表（rule_id → 人读标签 + 出处）
+#
+# 用途：
+#   1. Step 2 的 data.threshold_flags 只存**机器码**（短、稳定、可溯源）；
+#   2. 拼大模型提示词时，由 render_rule_hits 把码翻回中文事实句（只活在 prompt 里）；
+#   3. 下游（Step 6 门禁 / 报告溯源）直接吃码，不用正则解析中文。
+#
+# 命名规范（本项目自定）：<测点>_<位置>_<性质>
+#   · 测点：BEARING_TEMP / VIB / FLOW / PRESS / CURRENT / CV
+#   · 位置：DE（驱动端）/ NDE（非驱动端）/ 省略
+#   · 性质：TRIP / WARN / SHARP / SLOW / HIGH / LOW / DOMINANT / DEV / UNSTABLE
+#
+# ★ 这不是 SCADA 的 ISA-5.1 报警码（TAH-101 那一套）。
+#   那套是数据里的**报警事实**，归 data.alarms；本表是 Step 2 **自算判据**的码。
+#
+# ★ extra_field / extra_template：少数规则额外要附一句上下文（如"约从 08:01:00 开始"），
+#   渲染器会从该 phase 里取 extra_field 的值填进模板，取不到就不加。
+# =============================================================================
+
+RULE_CATALOG: Final[dict[str, dict]] = {
+    # —— 温度（只判驱动端）——
+    "BEARING_TEMP_DE_TRIP": dict(
+        label="驱动端温度超停机线", source="GB 50275-2010 / 规范第三节"),
+    "BEARING_TEMP_DE_WARN": dict(
+        label="驱动端温度超预警线", source="规范第三节"),
+    "BEARING_TEMP_DE_RAMP_SHARP": dict(
+        label="驱动端温度急剧恶化", source="规范 5.2",
+        extra_field="ramp_start_time", extra_template="，约从 {v} 开始"),
+    "BEARING_TEMP_DE_RAMP_SLOW": dict(
+        label="驱动端温度缓慢劣化", source="规范 5.2",
+        extra_field="ramp_start_time", extra_template="，约从 {v} 开始"),
+    # —— 振动 ——
+    "VIB_DE_TRIP": dict(label="驱动端振动超国标停机线", source="GB 50275 附录 A"),
+    "VIB_DE_WARN": dict(label="驱动端振动超良好区上限", source="GB 50275 附录 A"),
+    "VIB_NDE_TRIP": dict(label="非驱动端振动超国标停机线", source="GB 50275 附录 A"),
+    "VIB_NDE_WARN": dict(label="非驱动端振动超良好区上限", source="GB 50275 附录 A"),
+    "VIB_BOTH_HIGH": dict(label="两端振动同步偏高", source="规范第四节"),
+    "VIB_DE_DOMINANT": dict(label="驱动端振动显著高于非驱动端", source="规范第四节"),
+    "VIB_NDE_DOMINANT": dict(label="非驱动端振动显著高于驱动端", source="规范第四节"),
+    # —— 水力 ——
+    "FLOW_DEV": dict(label="流量工况偏离额定值", source="规范 5.1"),
+    "PRESS_OUT_DEV": dict(label="出口压力工况偏离额定值", source="规范 5.1"),
+    "PRESS_IN_LOW": dict(label="入口压力低", source="规范第三节 / 第六节 PAL-103"),
+    "CV_UNSTABLE": dict(label="流量/压力波动超离散度阈值", source="规范 5.3"),
+    # —— 电气 ——
+    "CURRENT_HIGH": dict(label="电机电流超额定满载", source="规范第六节 IAH-106"),
+    "CURRENT_LOW": dict(label="电机电流欠载", source="规范第六节 IAL-105"),
+}
