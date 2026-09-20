@@ -5,7 +5,7 @@ from pathlib import Path
 from src.orchestrator.graph import build_diagnosis_graph
 
 
-OUTPUT_PATH = Path("data") / "diagnosis_graph.png"
+OUTPUT_PATH = Path("docs") / "diagnosis_graph.png"
 
 
 def export_graph_png(output_path: Path = OUTPUT_PATH) -> Path:

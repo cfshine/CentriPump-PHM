@@ -11,10 +11,10 @@ from src.orchestrator.nodes import (
     reporter_node,
     router_node,
     safety_guard_node,
-    scada_fetch_node,
+    # scada_fetch_node,
     vision_node,
 )
-from src.schemas.state import PumpDiagnosisState
+from src.schemas.state import DiagnosisState
 
 
 def build_diagnosis_graph():
@@ -26,11 +26,11 @@ def build_diagnosis_graph():
     Router 负责写入 route。SCADA 和 Vision 节点将来根据 route 自行跳过
     不存在的输入，因此图的拓扑保持稳定，证据合并节点也不会等待缺失分支。
     """
-    graph = StateGraph(PumpDiagnosisState)
+    graph = StateGraph(DiagnosisState)
 
     graph.add_node("router", router_node)
     graph.add_node("engineer_text", engineer_text_node)
-    graph.add_node("scada_fetch", scada_fetch_node)
+    # graph.add_node("scada_fetch", scada_fetch_node)
     graph.add_node("data", data_node)
     graph.add_node("vision", vision_node)
     graph.add_node("evidence_merge", evidence_merge_node)
@@ -41,9 +41,9 @@ def build_diagnosis_graph():
 
     graph.add_edge(START, "router")
     graph.add_edge("router", "engineer_text")
-    graph.add_edge("router", "scada_fetch")
+    # graph.add_edge("router", "scada_fetch")
     graph.add_edge("router", "vision")
-    graph.add_edge("scada_fetch", "data")
+    graph.add_edge("router", "data")
     graph.add_edge(
         ["engineer_text", "data", "vision"],
         "evidence_merge",
