@@ -140,7 +140,6 @@ CentriPump-PHM 全局工作流状态定义。
 from __future__ import annotations
 
 from typing import Any, Literal
-
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -213,9 +212,37 @@ def _assert_checkpoint_safe(value: Any, path: str) -> None:
         tuple -> list
     """
 
-    # dict：递归检查所有 value。
+    # 【新增】BaseModel（嵌套 State 子模型）：
+    # 先转成原生 dict，再递归检查。
+    #
+    # 为什么需要这个分支？
+    # --------------------
+    # State 中的嵌套子模型（例如 DataQuality / TelemetryRef）
+    # 在 Pydantic 校验完成后仍然是 BaseModel 实例，
+    # 而不是 dict。
+    #
+    # 如果不处理 BaseModel，
+    # 所有包含嵌套子模型的 State
+    # 都会在构造时被误判为“无法安全进入 checkpoint”。
+    #
+    # model_dump() 保留 python 原生类型，
+    # 不会把数值转成 JSON 字符串，
+    # 因此 numpy.float64 等非法类型仍然能被检查出来。
+    if isinstance(value, BaseModel):
+        _assert_checkpoint_safe(value.model_dump(), path)
+        return
+
+    # dict：递归检查所有 key 和 value。
     if type(value) is dict:
         for key, item in value.items():
+            # 【新增】msgpack 的 map key 必须是 str，
+            # 所以 key 的类型也需要检查。
+            if type(key) is not str:
+                raise TypeError(
+                    f"状态字段 {path} 的 dict key 类型 "
+                    f"{type(key).__name__} 无法安全进入 checkpoint。"
+                    "dict key 必须转换为 str。"
+                )
             _assert_checkpoint_safe(item, f"{path}.{key}")
         return
 
@@ -464,54 +491,6 @@ class ContextState(StateModel):
 # 三、Data —— Step 2 时序数据分析
 # =============================================================================
 
-class DataDescription(BaseModel):
-    """
-    Data Agent 对原始数据分析结果进行语义化后的单条描述。
-
-    注意：
-    这里描述的是“数据表现出来的现象”，
-    而不是“故障原因”。
-
-    例如：
-        正确：
-            “振动 RMS 在报警前 30 秒持续升高，并超过预警阈值。”
-
-        不应该：
-            “初步判断为轴承故障。”
-
-    后者属于 Reasoning Agent 的因果分析职责。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal[
-        "TREND",       # 趋势特征
-        "ANOMALY",     # 异常特征
-        "THRESHOLD",   # 阈值越界
-        "CORRELATION", # 多指标之间的相关变化
-        "ALARM",       # 报警相关特征
-        "OTHER",       # 其他数据特征
-    ] = Field(
-        description="该语义特征的类型。"
-    )
-
-    description: str = Field(
-        min_length=1,
-        description=(
-            "对数据现象的自然语言描述。"
-            "只能描述观测到的数据特征，不得直接进行故障归因。"
-        ),
-    )
-
-    evidence: list[str] = Field(
-        default_factory=list,
-        description=(
-            "支撑该描述的原始数据字段或计算指标名称。"
-            "例如：['vibration_rms', 'temperature']。"
-        ),
-    )
-
-
 class TelemetryRef(StateModel):
     """
     原始遥测数据的引用。
@@ -607,6 +586,59 @@ class AlarmState(StateModel):
     """
     整个窗口内出现过的报警码。
     """
+
+class DataDescription(StateModel):
+    """
+    Data Agent 对原始数据分析结果进行语义化后的单条描述。
+
+    注意：
+    这里描述的是“数据表现出来的现象”，
+    而不是“故障原因”。
+
+    例如：
+        正确：
+            “振动 RMS 在报警前 30 秒持续升高，并超过预警阈值。”
+
+        不应该：
+            “初步判断为轴承故障。”
+
+    后者属于 Reasoning Agent 的因果分析职责。
+    """
+
+    # 【修改】这里继承 StateModel（原来是 BaseModel），
+    # 与项目中其它 State 子模型保持一致，
+    # 从而获得：
+    #   1. extra="forbid"
+    #   2. checkpoint 类型安全检查
+    #
+    # 不再单独写 model_config。
+
+    type: Literal[
+        "TREND",       # 趋势特征
+        "ANOMALY",     # 异常特征
+        "THRESHOLD",   # 阈值越界
+        "CORRELATION", # 多指标之间的相关变化
+        "ALARM",       # 报警相关特征
+        "OTHER",       # 其他数据特征
+    ] = Field(
+        description="该语义特征的类型。"
+    )
+
+    description: str = Field(
+        min_length=1,
+        description=(
+            "对数据现象的自然语言描述。"
+            "只能描述观测到的数据特征，不得直接进行故障归因。"
+        ),
+    )
+
+    evidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "支撑该描述的原始数据字段或计算指标名称。"
+            "例如：['vibration_rms', 'temperature']。"
+        ),
+    )
 
 
 class DataState(StateModel):
@@ -1781,9 +1813,7 @@ def create_initial_state(
                 last="NONE",
                 all=[],
             ),
-            description="",
-            basic_judgment="",
-            rag_queries=[],
+            descriptions=[],
         ),
 
         vision=VisionState(
