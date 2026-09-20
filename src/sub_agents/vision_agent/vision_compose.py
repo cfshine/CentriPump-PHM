@@ -1,7 +1,9 @@
-"""结论组装层：把逐图结论拼成"给人读的文本"和"给机器读的盒子"（**纯函数层**）。
+"""结论组装层：把逐图结论拼成"给人读的文本"（**纯函数层**）。
 
 职责：
-    · ``compose_description()``：多图结论 → 一段 ``visual_description`` 文本；
+    · ``compose_summary()``：多图结论 → 写进 ``vision.summary`` 的整段文本
+      （= 每图描述 + 末尾的"未核验汇总"节）；
+    · ``compose_description()``：只拼每图描述那部分（``compose_summary`` 的内核）；
     · ``ref_label()``：图片引用 → 图名锚点（``leak_close.png``）；
     · ``failed_image()``：把一张失败的图变成带原因的占位结论；
     · ``FAILED_PREFIX``：判定"这张图失败了"的唯一标志。
@@ -9,13 +11,13 @@
 约定：
     · 本层**不依赖 LangGraph / 大模型 / Pillow / Tesseract** —— 只吃已经算好的
       ``VisionImage``，所以想改文本格式时不必碰模型和图片 IO。
-    · ``compose_description`` 是 ``visual_description`` 的**唯一写入者**：
-      文本永远由结构化盒子派生，两者不会各说各话。
+    · ``compose_summary`` 是 ``vision.summary`` 的**唯一写入者**：
+      文本永远由结构化结论派生，两者不会各说各话。
 """
 
 from __future__ import annotations
 
-from src.schemas.vision import VisionImage
+from src.sub_agents.vision_agent.vision_models import VisionImage
 
 #: 失败占位的描述前缀（``basis`` 字段已删，下游靠这个前缀识别"这张没识别成功"）
 FAILED_PREFIX = "（本图识别失败"
@@ -53,10 +55,10 @@ def ref_label(ref: str) -> str:
 
 
 def compose_description(refs: list[str], images: list[VisionImage]) -> str:
-    """串联每张图结论（写进 ``visual_description``）。
+    """串联每张图的描述部分（``compose_summary`` 的内核）。
 
     参数：
-        refs:   清洗后的图片清单（与 ``images`` **等长同序**，只用于取图名做锚点）。
+        refs:   图片引用清单（与 ``images`` **等长同序**，只用于取图名做锚点）。
         images: 各图的 ``VisionImage``。
 
     返回：
@@ -81,3 +83,33 @@ def compose_description(refs: list[str], images: list[VisionImage]) -> str:
             block += f"\n本图未核验：{'；'.join(limits)}"
         blocks.append(block)
     return "\n\n".join(blocks)
+
+def compose_summary(refs: list[str], images: list[VisionImage]) -> str:
+    """组装写进 ``vision.summary`` 的整段文本（每图描述 + 未核验汇总）。
+
+    参数：
+        refs:   图片引用清单（与 ``images`` 等长同序）。
+        images: 各图的 ``VisionImage``。
+
+    返回：
+        :func:`compose_description` 的产物；若任何一图有 ``limitations``，
+        再在末尾追加一节"未核验汇总"：
+
+            未核验汇总：
+            - [图1] leak_close.png：反光导致刻度读不清；OCR 未生效（缺 chi_sim 字库）
+            - [图3] nameplate.png：铭牌被油污遮挡
+    """
+    text = compose_description(refs, images)
+
+    lines: list[str] = []
+    for idx, image in enumerate(images, 1):
+        limits = [str(x).strip() for x in (image.limitations or []) if str(x).strip()]
+        if not limits:
+            continue
+        label = ref_label(refs[idx - 1]) if idx <= len(refs) else f"图{idx}"
+        lines.append(f"- [图{idx}] {label}：{'；'.join(limits)}")
+
+    if not lines:
+        return text
+    tail = "未核验汇总：\n" + "\n".join(lines)
+    return f"{text}\n\n{tail}" if text else tail

@@ -6,8 +6,10 @@
 
     pytest tests/test_vision_agent.py -q -rs     # -rs 会把 skip 原因打出来
 
-2026-09-17 精简后：Step 3 不再是子图，而是一个普通节点函数 ``vision_node``；
-结构化输出只保留 3 个字段（natural_description / observations / limitations）。
+2026-09-20 适配组长 9 盒子契约：Step 3 仍是普通节点函数 ``vision_node``，但
+· 输入改读 ``state.context.image_refs``（``list[ImageRef]``）；
+· 产出只回写 ``state.vision``（``VisionState{status, findings, summary}``）；
+· ``VisionFindings`` 盒子已拆解 —— abnormal 观测逐条升级为 ``VisionFinding``。
 """
 
 from __future__ import annotations
@@ -35,13 +37,27 @@ def _sample_images() -> list[Path]:
     )
 
 
-def _as_findings(value) -> VisionFindings:
-    """节点返回的可能是模型实例、也可能是 dict，统一成 VisionFindings。"""
-    return value if isinstance(value, VisionFindings) else VisionFindings.model_validate(value)
+def _state(refs=None, device_id: str = "PUMP-TEST") -> DiagnosisState:
+    """造一个**真实状态**（节点已改读 ``state.context``，不能再传普通 dict）。"""
+    return create_initial_state(
+        trace_id="vision-test", device_id=device_id,
+        start_time="", end_time="", image_refs=refs or [],
+    )
 
 
-from src.schemas.state import DiagnosisState
-from src.schemas.vision import Observation, VisionFindings, VisionImage
+def _ref(uri: str, image_id: str = "img-1") -> ImageRef:
+    """造一个图片引用（``uri`` 用于读图，``image_id`` 会带进每条 finding）。"""
+    return ImageRef(image_id=image_id, uri=uri)
+
+
+def _vision(out: dict) -> VisionState:
+    """取出节点回写的 vision 盒子（模型实例或 dict 都统一成 VisionState）。"""
+    value = out["vision"]
+    return value if isinstance(value, VisionState) else VisionState.model_validate(value)
+
+
+from src.schemas.state import DiagnosisState, ImageRef, VisionState, create_initial_state
+from src.sub_agents.vision_agent.vision_models import Observation, VisionImage
 from src.sub_agents.vision_agent import vision_client as vc
 from src.sub_agents.vision_agent import vision_nodes as vn
 from src.sub_agents.vision_agent import vision_pipeline as vp
@@ -70,24 +86,36 @@ _MIN_JPEG = (
 # =============================================================================
 
 
-def test_public_contract_shares_description_and_typed_box() -> None:
-    """公共契约 = 人读的一段的描述 + 机器读的强类型盒子；被剔除的字段不许回来。"""
+def test_public_contract_has_vision_box() -> None:
+    """★ 2026-09-20：Step 3 的产出在组长的 ``vision`` 盒子里，不再是顶层扁平字段。"""
     public = set(DiagnosisState.model_fields)
-    assert {"visual_description", "visual_findings"} <= public
-    assert DiagnosisState.model_fields["visual_findings"].annotation is VisionFindings, (
-        "visual_findings 必须是强类型 VisionFindings，不是 dict[str, Any] 袋子"
-    )
-    assert not ({"visual_rag_queries", "content_type", "extracted_text",
-                 "route_used"} & public)
+    assert "vision" in public
+    assert DiagnosisState.model_fields["vision"].annotation is VisionState
+    assert set(VisionState.model_fields) == {"status", "findings", "summary"}
+
+    # 旧的扁平字段与旧盒子都不许回来
+    assert not ({"visual_description", "visual_findings", "visual_rag_queries",
+                 "content_type", "extracted_text", "route_used"} & public)
+    import src.sub_agents.vision_agent.vision_models as vm
+    assert not hasattr(vm, "VisionFindings"), "旧盒子已拆解，不该回来"
 
 
 def test_box_has_exactly_three_fields_per_image() -> None:
-    """★ 契约精简：每张图**只有 3 个字段**，多一个都不许回来（防回退回潮）。"""
+    """★ 契约防回潮：每张图的盒子仍是 3 个字段；Observation 多了"缺陷四要素"。
+
+    2026-09-20：为对齐组长 ``VisionFinding``，``Observation`` 新增/恢复了
+    ``defect_type / severity / confidence / evidence``
+    —— 它们只在 ``polarity == "abnormal"`` 时有意义，由提示词要求模型必填。
+    """
     assert set(VisionImage.model_fields) == {
         "natural_description", "observations", "limitations"
     }
-    assert set(Observation.model_fields) == {"target", "finding", "polarity"}
-    assert set(VisionFindings.model_fields) == {"images"}
+    assert set(Observation.model_fields) == {
+        "target", "finding", "polarity",                        # 基础三件套
+        "defect_type", "severity", "confidence", "evidence",    # 缺陷四要素
+    }
+    # ★ 2026-09-20：VisionFindings 盒子已拆除（组长的契约里没有它的位置），
+    #   所以这里不再断言它 —— 由 test_public_contract_has_vision_box 守着"不许回来"。
 
 
 # =============================================================================
@@ -240,10 +268,13 @@ def test_empty_image_refs_skips_everything(monkeypatch) -> None:
         raise AssertionError("空图不应调用视觉模型")
 
     monkeypatch.setattr(vp, "understand_image", boom)
-    out = vn.vision_node({"image_refs": []})
-    assert out["image_refs"] == []
-    assert out["visual_description"] == ""
-    assert _as_findings(out["visual_findings"]).images == []
+    out = vn.vision_node(_state())
+
+    assert list(out) == ["vision"], "只回写 vision 一个盒子"
+    v = _vision(out)
+    assert v.status == "NO_IMAGE"
+    assert v.findings == []
+    assert v.summary == ""
 
 
 @requires_key
@@ -267,12 +298,15 @@ def test_useful_ocr_text_is_passed_to_model_but_never_skips_it(tmp_path, monkeyp
         return original(data, content_type, ocr_text, state)
 
     monkeypatch.setattr(vp, "understand_image", spy)
-    out = vn.vision_node({"device_id": "PUMP-TEST", "image_refs": [str(ref)]})
+    out = vn.vision_node(_state([_ref(str(ref))]))
 
     assert "ALARM FAL-104" in seen["ocr_text"], "有用文本被塞进了提示词"
-    image = _as_findings(out["visual_findings"]).images[0]
-    assert image.natural_description == "模型看图后的描述", "描述来自模型"
-    assert image.observations[0].polarity == "abnormal"
+    v = _vision(out)
+    assert "模型看图后的描述" in v.summary, "描述来自模型"
+
+    # ★ D3：这条观测是 abnormal 但没有缺陷四要素 → 跳过并记进"未核验"
+    assert v.findings == []
+    assert "缺少完整的缺陷要素" in v.summary
 
 
 @requires_key
@@ -285,7 +319,7 @@ def test_ocr_failure_is_reported_but_vision_still_runs(tmp_path, monkeypatch) ->
     monkeypatch.setattr(vc, "vision_model", _fake_model(VisionImage(
         natural_description="纯视觉结论", observations=[], limitations=[])))
 
-    image = vp.analyze_one(str(ref), {"device_id": "PUMP-TEST"})
+    image = vp.analyze_one(str(ref), _state())
     assert image.natural_description == "纯视觉结论"
     assert any("OCR 未生效" in lim for lim in image.limitations), "必须如实写进限制项"
     assert "OCR 未生效" in compose_description([str(ref)], [image]), "也要出现在文本里"
@@ -322,13 +356,14 @@ def test_batch_keeps_good_images_when_one_fails(tmp_path, monkeypatch) -> None:
         return VisionImage(natural_description=f"{ref} 的结论")
 
     monkeypatch.setattr(vn, "analyze_one", fake_analyze_one)
-    out = vn.vision_node({"image_refs": [str(good), "坏图.png", str(good)]})
+    out = vn.vision_node(_state([_ref(str(good), "i1"), _ref("坏图.png", "i2"),
+                                 _ref(str(good), "i3")]))
 
-    images = _as_findings(out["visual_findings"]).images
-    assert len(images) == 3, "每张图都要有一条结论（失败的用占位）"
-    assert images[1].natural_description.startswith(FAILED_PREFIX)
-    assert images[0].natural_description.endswith("的结论"), "好图的结论必须还在"
-    assert str(good) in out["visual_description"] and "坏图.png" in out["visual_description"]
+    v = _vision(out)
+    assert v.status == "NO_DEFECT", "有图且至少一张成功、又没缺陷"
+    assert v.findings == []
+    assert v.summary.count("的结论") == 2, "两张好图的结论必须都还在"
+    assert "坏图.png" in v.summary and FAILED_PREFIX in v.summary
 
 
 @requires_key
@@ -339,26 +374,24 @@ def test_failed_image_reason_is_in_box_and_text(monkeypatch) -> None:
         raise ValueError("不支持的图片格式（需要 JPEG / PNG / GIF / WebP）")
 
     monkeypatch.setattr(vn, "analyze_one", boom)
-    out = vn.vision_node({"image_refs": ["bad.png"]})
+    out = vn.vision_node(_state([_ref("bad.png")]))
 
-    failed = _as_findings(out["visual_findings"]).images[0]
-    assert failed.natural_description.startswith(FAILED_PREFIX)
-    assert failed.observations == []
-    assert any("不支持的图片格式" in lim for lim in failed.limitations)
-    text = out["visual_description"]
-    assert "bad.png" in text and "识别失败" in text and "不支持的图片格式" in text
+    v = _vision(out)
+    assert v.status == "FAILED", "唯一一张图失败了"
+    assert v.findings == []
+    assert "bad.png" in v.summary
+    assert "识别失败" in v.summary and "不支持的图片格式" in v.summary
 
 
 @requires_key
 def test_all_images_failed_keeps_shape(monkeypatch) -> None:
     """全坏时形状照样恒定：结论条数 = 图片数，每条都是失败占位。"""
     monkeypatch.setattr(vn, "analyze_one", lambda ref, state: (_ for _ in ()).throw(OSError("坏")))
-    out = vn.vision_node({"image_refs": ["a.png", "b.png"]})
+    out = vn.vision_node(_state([_ref("a.png", "i1"), _ref("b.png", "i2")]))
 
-    images = _as_findings(out["visual_findings"]).images
-    assert len(images) == 2
-    assert all(i.natural_description.startswith(FAILED_PREFIX) for i in images)
-    assert out["visual_description"].count("识别失败") == 2
+    v = _vision(out)
+    assert v.status == "FAILED"
+    assert v.summary.count("识别失败") == 2
 
 
 # =============================================================================
@@ -398,7 +431,7 @@ def test_vision_model_retries_transient_failure_then_succeeds(monkeypatch) -> No
         "with_structured_output": lambda self, schema: chain})())
     monkeypatch.setattr(time, "sleep", lambda _s: None)  # 别真等 1s+2s
 
-    result = vc.understand_image(_MIN_PNG, "image/png", "", {"device_id": "P"})
+    result = vc.understand_image(_MIN_PNG, "image/png", "", _state(device_id="P"))
     assert result.natural_description == "重试后成功"
     assert chain.calls == 3, "前两次失败后第三次成功"
 
@@ -419,7 +452,7 @@ def test_vision_model_does_not_retry_insufficient_balance(monkeypatch) -> None:
     monkeypatch.setattr(time, "sleep", lambda _s: slept.__setitem__("n", slept["n"] + 1))
 
     with pytest.raises(RuntimeError, match="Insufficient Balance"):
-        vc.understand_image(_MIN_PNG, "image/png", "", {"device_id": "P"})
+        vc.understand_image(_MIN_PNG, "image/png", "", _state(device_id="P"))
     assert calls["n"] == 1, "硬错误只调一次"
     assert slept["n"] == 0, "不该退避等待"
 
@@ -457,12 +490,14 @@ def test_parent_graph_exposes_contract_without_internal_fields() -> None:
     parent.add_edge(START, "step3")
     parent.add_edge("step3", END)
 
-    out = dict(parent.compile().invoke({"image_refs": []}))
-    assert out["visual_description"] == ""
-    assert _as_findings(out["visual_findings"]).images == []
-    leaked = {"visual_rag_queries", "route", "image_kind", "ocr_text", "content_type",
-              "current_ref", "need_vision", "route_used", "extracted_text"} & set(out)
-    assert not leaked, f"这些键不该回流父图：{leaked}"
+    out = dict(parent.compile().invoke(_state().model_dump()))
+    v = out["vision"] if isinstance(out["vision"], VisionState) else VisionState.model_validate(out["vision"])
+    assert v.status == "NO_IMAGE"
+    assert v.findings == []
+
+    # 回流的键不得超出公共契约（没有私有键外流）
+    leaked = set(out) - set(DiagnosisState.model_fields)
+    assert not leaked, f"这些键不该回流父图：{sorted(leaked)}"
 
 
 @requires_key
@@ -476,18 +511,17 @@ def test_sample_image_live_returns_description_and_box() -> None:
         pytest.skip(f"{_SAMPLE_ROOT} 下还没有样例图（放图后本用例自动生效）")
 
     first = images_path[0]
-    out = vn.vision_node({"device_id": "PUMP-IS100-80-160-01",
-                          "alarm_code": "FAL-104", "image_refs": [str(first)]})
+    out = vn.vision_node(_state([_ref(str(first), "img-live")],
+                                device_id="PUMP-IS100-80-160-01"))
 
-    text = out["visual_description"]
-    assert text.startswith(f"[图1] {first.name}"), f"锚点不对：{text[:60]!r}"
+    v = _vision(out)
+    assert v.summary.startswith(f"[图1] {first.name}"), f"锚点不对：{v.summary[:60]!r}"
+    assert v.status in {"NO_DEFECT", "DEFECT_FOUND"}, f"不该是 {v.status}"
 
-    findings = _as_findings(out["visual_findings"])
-    assert len(findings.images) == 1, "一张图一份结论"
-    image = findings.images[0]
-    assert image.natural_description.strip(), "描述不能为空"
-    # ★ 文本必须由盒子派生
-    assert image.natural_description in text
-    for obs in image.observations:
-        assert obs.polarity in {"abnormal", "normal", "unknown"}
-        assert obs.target.strip() and obs.finding.strip()
+    # 每条 finding 必须带全组长的六个字段，且能回溯到那张图
+    for f in v.findings:
+        assert f.image_id == "img-live"
+        assert f.defect_type.strip(), "defect_type 不能为空"
+        assert f.severity in {"MINOR", "MODERATE", "SEVERE"}
+        assert f.location.strip() and f.evidence.strip()
+        assert 0.0 <= f.confidence <= 1.0

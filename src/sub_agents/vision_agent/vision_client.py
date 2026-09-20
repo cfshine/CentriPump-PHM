@@ -4,11 +4,6 @@
     · ``load_vision_prompt()``：读 ``configs/prompts/vision_agent.yaml`` 并缓存；
     · ``understand_image()``：图（已缩放）+ 可选 OCR 文本 → ``VisionImage`` 三字段结论；
     · ``is_retryable()``：区分"重试有用"的网络抖动 与 "重试白等" 的硬错误。
-
-为什么单独一层：
-    整个 Step 3 只有这里会花钱、会受网络影响、会自带重试策略。
-    把它关进一个文件之后，管道层（``vision_pipeline.py``）和编排层（``vision_nodes.py``）
-    都能在不碰大模型的前提下读懂，也能被 monkeypatch 换掉做单测。
 """
 
 from __future__ import annotations
@@ -20,7 +15,7 @@ import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.schemas.state import DiagnosisState
-from src.schemas.vision import VisionImage
+from src.sub_agents.vision_agent.vision_models import VisionImage
 from src.sub_agents.vision_agent.image_io import to_data_url
 from src.utils.config_loader import PROJECT_PATH
 from src.utils.llm_client import vision_model
@@ -101,23 +96,11 @@ def understand_image(
 
     返回：
         ``VisionImage``（模型填的 natural_description / observations / limitations）。
-
-    重试策略：
-        · 最多调 ``VISION_MAX_ATTEMPTS`` 次（默认 3，含首次），退避 1s、2s；
-        · **可恢复**错误 → 重试；**硬错误**（余额不足/鉴权失败/请求不合法）→ 立刻抛；
-        · 结构化输出返回 None（通常是被 max_tokens 截断）→ 也重试。
-        · 本函数是**视觉链路唯一的重试层**：``vision_model`` 已显式
-          ``max_retries=0``（关掉底层 SDK 自己的重试），所以最坏情况可预测：
-          3 次真实 HTTP 请求 + 1s/2s 退避。
-
-    失败（重试用尽后抛出）：
-        RuntimeError（结构化输出始终解析失败）或网络/鉴权异常原样抛出。
-        ⚠ 绝不降级成"仅 OCR"：OCR 只做辅助，拿它冒充视觉结论比明确失败更危险。
     """
     prompt = load_vision_prompt()
     user = prompt["user"].format(
-        device_id=state["device_id"] or "",
-        alarm_code=state.get("alarm_code") or "NONE",
+        device_id=state.context.device_id or "",
+        alarm_code=state.context.alarm_code or "NONE",
         ocr_text=ocr_text or "（无 OCR 结果）",
     )
     data_url = to_data_url(data, content_type)

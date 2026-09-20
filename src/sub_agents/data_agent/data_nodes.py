@@ -5,13 +5,6 @@
   · 通用时序工具     → src/sub_agents/data_agent/timeseries_tools.py
   · 取数（ORM/查询） → src/sub_agents/data_agent/data_tools.py
   · 提示词           → configs/prompts/data_agent.yaml
-
-★ 2026-09-20 适配组长的 9 盒子契约：
-    · 输入不再在顶层，改读 ``state.context``（device_id / start_time / end_time / trace_id）；
-    · 产出不再写顶层字段，改写成 ``state.data``（DataState）；
-    · 回写统一走 ``_data_update`` —— 必须带上盒子里其他字段，且必须走校验；
-    · **只回写 data 一个顶层盒子**：主图里 data 与 vision 是并行分支，
-      回写整份 state 会覆盖 vision 的产出。
 """
 from functools import lru_cache
 from typing import Literal
@@ -71,14 +64,6 @@ def _data_update(state: DiagnosisState, **updates) -> dict:
 
     返回：
         ``{"data": DataState}``。
-
-    两个必须这么写的理由（都是实测出来的）：
-        1. LangGraph 用返回值**替换整个盒子**：只返回部分字段，会把盒子里其他字段
-           （比如 analyze 刚写好的 metrics）一起冲掉。所以先摊平现有内容再覆盖。
-        2. 不能用 Pydantic 的 ``model_copy(update=...)`` —— 它**不跑校验器**，会绕过
-           ``StateModel`` 的 checkpoint 类型检查（只允许精确的
-           str/int/float/bool/None/list/dict）。这里用 ``model_validate`` 重新构造，
-           校验当场发生。
     """
     return {"data": DataState.model_validate({**state.data.model_dump(), **updates})}
 
@@ -94,7 +79,7 @@ class DescriptionOut(BaseModel):
         evidence:    支撑该描述的指标名或规则码，如 ``['max_temp_de', 'slope_temp_de']``
 
     说明：
-        这里是"大模型返回值"的契约；节点会把它映射成组长的 ``DataDescription``，
+        这里是"大模型返回值"的契约；节点会把它映射成 ``DataDescription``，
         并按白名单过滤 evidence（编造的指标名会被丢掉）。
     """
 
@@ -113,12 +98,6 @@ class DescriptionOut(BaseModel):
 
 class SemanticizeOutput(BaseModel):
     """``summarize_node`` 的 LLM 输出契约：**多条**数据现象描述，按 type 分类。
-
-    ★ 为什么是列表而不是一段话（2026-09-20）：
-      组长的 ``DataState.descriptions`` 是 ``list[DataDescription]``，
-      下游（Step 4 RAG / Step 7 报告）要按类别取用；
-      一段整话既没法检索、也没法按类型筛选。
-      条数上限定 6 条是为了防大模型"刷条数"把描述拆成流水账。
     """
 
     descriptions: list[DescriptionOut] = Field(
@@ -138,11 +117,6 @@ def _evidence_whitelist(overall: dict, phases: list[dict], rule_codes: list[str]
 
     返回：
         可接受的 evidence 名字集合。
-
-    为什么要过滤：
-        组长的契约要求 evidence 能回溯到真实数据。大模型偶尔会写
-        "bearing_temperature" 这种看起来合理、但材料里根本不存在的名字；
-        与其在报告里留下无法溯源的证据，不如在入口就把它减掉。
     """
     allowed = set(overall)
     for ph in phases:
@@ -256,13 +230,6 @@ def summarize_node(state: DiagnosisState) -> dict:
     返回：
         正常          → ``{"data": DataState}``，``descriptions`` 里装 1~6 条按 type 分类的现象描述
         没窗口 / 没数据 → ``{}``（什么都不写，也**不调大模型**）
-
-    ★ 时间窗口的判断与 ``analyze_node`` 里那一行必须**完全一致**，否则会出现
-      "取数跳过了、语义化却照调大模型"这种半截状态。
-    ★ 没有数据时不写描述：降级原因已经在 ``data.quality.reason`` 里，
-      再生成一段"未做分析"的话只会污染 descriptions。
-    ★ evidence 会按白名单过滤（只留材料里出现过的指标名/规则码），
-      防止大模型编造无法溯源的证据。
     """
     ctx = state.context
     if not (ctx.start_time.strip() and ctx.end_time.strip()):
@@ -297,7 +264,7 @@ def summarize_node(state: DiagnosisState) -> dict:
             "请调大 src/utils/llm_client.py 里的 max_tokens，或收紧提示词的长度要求"
         )
 
-    # 映射成大模型的返回值 → 组长的 DataDescription，并过滤掉编造的 evidence
+    # 映射成大模型的返回值 → 过滤掉编造的 evidence
     allowed_evidence = _evidence_whitelist(overall, phases, data.threshold_flags)
     descriptions = [
         DataDescription(

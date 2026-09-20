@@ -84,10 +84,6 @@ def _extract_alarm_codes(df: pd.DataFrame) -> tuple[str, str, list[str]]:
         ``effective``: 窗口内出现过的报警码去重排序（";" 连接）；无则 ``"NONE"``
         ``last``:      窗口内**最后一次**非 NONE 的报警码组合；无则 ``"NONE"``
         ``all``:       去重后的列表形式；无则 ``[]``
-
-    ★ 2026-09-20：对齐组长契约的 ``AlarmState{effective, last, all}`` 三件套
-      （这三个本来是扁平字段，组长把它们收拢成了子模型）。
-      仍然**只认窗口内的数据** —— Step 2 不读用户入参的 alarm_code。
     """
     valid_rows = df[df['alarm_code'].apply(_is_valid_alarm)]
     if valid_rows.empty:
@@ -173,12 +169,6 @@ def render_rule_hits(phases: list[dict]) -> str:
         每行一条，形如
         ``- [WARNING段 08:00:05~08:09:55] 驱动端温度超停机线（BEARING_TEMP_DE_TRIP）``；
         一条命中都没有时返回 ``"无"``。
-
-    为什么 state 里不存中文句子：
-        state 只留机器码（短、稳定、可溯源），中文只在拼提示词的这一刻生成。
-        具体观测值也不在这里重复 —— 分阶段指标已经把每段数值列全了。
-        少数规则要附的上下文（如温度斜率"约从 08:01:00 开始"）由码表的
-        ``extra_field`` / ``extra_template`` 声明，取不到就不加。
     """
     lines = []
     for ph in phases:

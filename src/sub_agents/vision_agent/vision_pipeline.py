@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from src.schemas.state import DiagnosisState
-from src.schemas.vision import VisionImage
+from src.sub_agents.vision_agent.vision_models import VisionImage
 from src.sub_agents.vision_agent.image_io import (
     detect_content_type,
     read_image_bytes,

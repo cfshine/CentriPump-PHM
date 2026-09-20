@@ -5,8 +5,20 @@
 > 2. 每个关键设计**为什么这么做**（尤其是"为什么每张图都必须过视觉大模型""为什么 OCR 只做辅助"）
 > 3. **怎么提测**（含中英文 OCR 引擎的系统级安装要求）
 >
-> ⚠ 本模块在 2026-09-17 做过一次**精简**：原来的 2 节点子图合并成**一个节点函数**，
-> 结构化输出**只保留 3 个字段**。本文档描述精简后的现状。
+> ⚠ 本模块在 2026-09-17 做过一次**精简**：原来的 2 节点子图合并成**一个节点函数**。
+>
+> ⚠⚠ **2026-09-20 契约大改（对齐组长 9 盒子）**：
+> · 输入：顶层 `image_refs: list[str]` → **`state.context.image_refs: list[ImageRef]`**；
+> · 产出：`visual_description` + `visual_findings` → **`state.vision`**
+>   （`VisionState{status, findings, summary}`），只回写 `vision` 一个盒子；
+> · `VisionFindings` 盒子**已拆解**：`polarity == "abnormal"` 的观测逐条升级为
+>   `VisionFinding`（每个缺陷一条，带 `image_id`）；
+> · 内部模型搬到 `vision_agent/vision_models.py`（不再占主图 Schema 目录）；
+> · `Observation` 新增/恢复**缺陷四要素**：`defect_type` / `severity` / `confidence` / `evidence`；
+> · 提示词 v2.0：清掉三处早已漂移的要求（`quantity` / `rag_queries` / `image_kind`）。
+>
+> ⚠ 本文**下方部分章节的字段名仍是旧版**（§2 数据流、§3.11 契约章节等），
+> 以本节为准；完整重写留待下一步。
 
 ---
 
@@ -15,33 +27,38 @@
 **一句话**：把上游递来的「一批图片（路径或 URL）」，变成两份东西 —— 一份**给人读的整段描述**（给 Step 4 做 RAG 检索、给 Step 7 写报告），一份**给机器读的结构化结论**（每张图的观测 / 极性 / 未核验项）。
 
 ```
-                  ┌──────────────────────────────────────────────┐
-  Step 1 / 用户 ──►│  vision_agent（Step 3）                      │
-  image_refs       │  vision_node(state)  ← 主图里就是一个节点     │
-  (list[str])      │    逐张 analyze_one：                        │
-                  │      读字节 → 判文件头 → OCR → 判噪声 →      │
-                  │      缩放 → **视觉大模型** → 组装             │
-                  └────────────────┬─────────────────────────────┘
-                                   │ 只回写 2 个公共字段（+ 清洗后的 image_refs）
-              ┌────────────────────┴────────────────────┐
-              ▼                                         ▼
-      visual_description                        visual_findings
-   （→ Step 4 RAG 检索 / Step 7 报告）      （→ 机器读：部位/现象/极性/未核验）
+                    ┌──────────────────────────────────────────────┐
+  Step 1 / 用户 ──►│  vision_agent（Step 3）                       │
+  state.context     │  vision_node(state)  ← 主图里就是一个节点      │
+  └ image_refs      │    逐张 analyze_one：                         │
+    (ImageRef[])    │      读字节 → 判文件头 → OCR → 判噪声 →       │
+                    │      缩放 → **视觉大模型** → 组装              │
+                    └────────────────┬─────────────────────────────┘
+                                     │ 只回写 vision 一个盒子
+                                     ▼
+                          state.vision（VisionState）
+              ┌──────────────────────┼──────────────────────┐
+              ▼                      ▼                      ▼
+           status                findings                summary
+     NO_IMAGE / FAILED /   每个缺陷一条 VisionFinding   人读：每图描述
+     NO_DEFECT /           (image_id / defect_type /    + 末尾"未核验汇总"
+     DEFECT_FOUND           severity / location /       （→ Step 4 RAG / Step 7 报告）
+                            confidence / evidence)
 ```
 
 ### 文件清单
 
 | 文件 | 行数 | 职责 | 依赖 LangGraph？ | 依赖大模型？ |
 | :--- | ---: | :--- | :---: | :---: |
-| `vision_nodes.py` | 81 | **编排层**：唯一节点 `vision_node`（批量 / 空图短路 / 失败隔离 / 写回契约） | ❌（普通函数） | ❌ |
+| `vision_nodes.py` | 153 | **编排层**：唯一节点 `vision_node`（批量 / 空图短路 / 失败隔离 / 缺陷映射 / 写回 `vision`） | ❌（普通函数） | ❌ |
 | `vision_pipeline.py` | 92 | **管道层**：单图 `analyze_one`（读图→OCR→体检→缩图→调模型，不写 State） | ❌ | 间接 ✅ |
 | `vision_client.py` | 155 | **模型层**：提示词 + `understand_image` + 重试（★ **唯一**碰大模型的文件） | ❌ | ✅ |
-| `vision_compose.py` | 100 | **组装层**：盒子 ↔ 文本（`compose_description` / `ref_label` / `failed_image`，纯函数） | ❌ | ❌ |
+| `vision_compose.py` | 120 | **组装层**：`compose_summary` / `compose_description` / `ref_label` / `failed_image`（纯函数） | ❌ | ❌ |
+| `vision_models.py` | 98 | **数据模型**：`VisionImage` / `Observation`（含缺陷四要素）/ `Severity` | ❌ | ❌（同时是模型的输出 schema） |
 | `image_io.py` | 201 | **工具层**：读图 / 判 MIME / 缩放 / 拼 data URL（`Pillow`，延迟导入） | ❌ | ❌ |
 | `ocr_runner.py` | 76 | **工具层**：调 Tesseract 认字 → `OcrResult`（`pytesseract` 是**可选**依赖，没装也不抛） | ❌ | ❌ |
 | `ocr_quality.py` | 136 | **工具层**：判 OCR 文本是"噪声"还是"有用"（`evaluate_ocr_quality` 是**纯函数**，零第三方依赖） | ❌ | ❌ |
-| `../../schemas/vision.py` | 89 | 3 字段契约：`VisionImage` / `VisionFindings` / `Observation` | ❌ | ❌（同时是模型的输出 schema） |
-| `../../../tests/test_vision_agent.py` | 493 | 27 条单测（契约 / 工具 / OCR / 编排 / 失败隔离 / 重试 / 真实图） | ❌ | 部分 ✅ |
+| `../../../tests/test_vision_agent.py` | 527 | 单测（契约 / 工具 / OCR / 编排 / 失败隔离 / 缺陷映射 / 重试 / 真实图） | ❌ | 部分 ✅ |
 | `../../../scripts/run_vision_samples.py` | 339 | 样例图跑批（人工验货，不进 CI） | ❌ | ✅ |
 
 > **已分层**（2026-09-18）：原 `vision_nodes.py`（356 行）按**"职责"**拆成四层 ——
@@ -526,7 +543,7 @@ monkeypatch 记录模型收到的 ocr_text
 | 节点 | 必须有 | 可选 | 缺"必须有"时的行为 |
 | :--- | :--- | :--- | :--- |
 | **Step 2** `data_agent`（子图） | `device_id` + `start_time` + `end_time` | 无（★ 2026-09-17 起 Step 2 **不再读** `alarm_code`，报警码一律取自窗口数据） | ✅ **软降级**：不查库、不计算、不调大模型，返回空结果 + 告警 `未提供时间窗口：本次未做时序分析` |
-| **Step 3** `vision_node`（节点函数） | `image_refs`（非空且可读） | `device_id`、`alarm_code` | ✅ 空清单 → 零成本短路（形状恒定）；单张坏图 → 该图失败占位 |
+| **Step 3** `vision_node`（节点函数） | `context.image_refs`（非空且可读） | `context.device_id`、`context.alarm_code` | ✅ 空清单 → `status=NO_IMAGE` 短路；单张坏图 → 该图失败占位（`status=FAILED`） |
 
 两者读的都是 A 类字段，写的键**完全不重叠**：
 
@@ -536,7 +553,7 @@ Step 2 写：calculated_metrics / threshold_flags / llm_description
             all_alarm_codes_in_window / basic_judgment / rag_search_queries
             五个字段已从公共契约删除；窗口内出现过的报警码改为
             calculated_metrics.overall.effective_alarm_codes）
-Step 3 写：image_refs（清洗后）/ visual_description / visual_findings
+Step 3 写：vision（VisionState{status, findings, summary}）
 ```
 
 ### 7.2 四种输入形态分别该跑什么（建议）

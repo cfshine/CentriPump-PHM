@@ -142,54 +142,71 @@ def _print_ocr_verdict(ref: Path) -> None:
     print(f"  OCR 体检 : {mark} | {detail}")
 
 
-def _as_findings(value):
-    """把子图返回的 ``visual_findings`` 统一成 ``VisionFindings`` 实例。
+def _state_for(ref, args):
+    """按新契约造一个"只含这一张图"的真实状态。
 
     参数：
-        value: 从 ``invoke`` 结果里取出的 ``visual_findings``
-               —— 可能是 ``VisionFindings`` 实例，也可能是等价的 dict
-               （取决于 LangGraph 内部是否已做 pydantic 校验）。
+        ref:  图片路径（``Path``）。
+        args: 命令行参数（取 ``device_id`` / ``alarm_code``）。
 
     返回：
-        ``VisionFindings`` 实例。``value`` 为 None 时返回空盒子。
+        ``DiagnosisState`` —— 图片以 ``ImageRef`` 形式放进 ``context.image_refs``。
 
-    为什么需要：
-        脚本不应该关心"LangGraph 这次给的是模型还是 dict"，
-        统一入口能让后面的 ``.images[0]`` 写得干净、也不会因版本差异而崩。
+    ★ 2026-09-20：节点的输入已从顶层 ``image_refs: list[str]`` 改成
+      ``context.image_refs: list[ImageRef]``，所以脚本也必须走组长的构造函数。
     """
-    from src.schemas.vision import VisionFindings
+    from src.schemas.state import ImageRef, create_initial_state
 
-    if value is None:
-        return VisionFindings()
-    return value if isinstance(value, VisionFindings) else VisionFindings.model_validate(value)
+    return create_initial_state(
+        trace_id=f"vision-sample-{ref.name}",
+        device_id=args.device_id,
+        start_time="",
+        end_time="",
+        alarm_code=args.alarm_code,
+        image_refs=[ImageRef(image_id=ref.name, uri=str(ref))],
+    )
 
 
-def _print_image(image) -> None:
-    """打印一张图的**结构化结论**（机器读的那一半）。
+def _vision_of(out: dict):
+    """从节点回写里取出 ``vision`` 盒子（模型实例或 dict 都统一成 VisionState）。
 
     参数：
-        image: ``schemas.vision.VisionImage``。
+        out: ``vision_node`` 的返回值（新契约下只含 ``vision`` 一个键）。
+
+    返回：
+        ``VisionState`` 实例。
+    """
+    from src.schemas.state import VisionState
+
+    value = out.get("vision")
+    return value if isinstance(value, VisionState) else VisionState.model_validate(value)
+
+
+def _print_findings(vision) -> None:
+    """打印这个窗口的**缺陷台账**（机器读的那一半，即组长的 findings）。
+
+    参数：
+        vision: ``VisionState``（含 status / findings / summary）。
 
     返回：
         无返回值，直接打印，形如：
 
-            obs=7  abnormal=3
-              obs[1] abnormal: 泵轴密封压盖 — 压盖与轴套交界处有深色油性液体附着…
-              ! 未核验: 无 OCR 结果，画面中未见可读铭牌、表计读数或屏显信息
+            status=DEFECT_FOUND  缺陷 3 条
+              [1] leak_close.png LEAK MODERATE conf=0.85 — 泵盖与机械密封压盖处
+                  依据: 压盖下方可见连续的深色液流痕迹…
     """
-    abnormal = sum(1 for o in image.observations if o.polarity == "abnormal")
-    print(f"  obs={len(image.observations)}  abnormal={abnormal}")
-    for i, obs in enumerate(image.observations, 1):
-        print(f"    obs[{i}] {obs.polarity}: {obs.target} — {obs.finding}")
-    for lim in image.limitations:
-        print(f"    ! 未核验: {lim}")
+    print(f"  status={vision.status}  缺陷 {len(vision.findings)} 条")
+    for i, f in enumerate(vision.findings, 1):
+        print(f"    [{i}] {f.image_id} {f.defect_type} {f.severity} "
+              f"conf={f.confidence} — {f.location}")
+        print(f"        依据: {f.evidence}")
 
 
 def _print_description(text: str) -> None:
     """打印子图交付的那段描述文本（给人读的那一半，也就是 Step4 拿去检索的东西）。
 
     参数：
-        text: ``visual_description`` 的内容（多图时含多段）。
+        text: ``vision.summary`` 的内容（多图时含多段 + 未核验汇总）。
 
     返回：
         无返回值，直接打印；空文本打印"（空）"提示。
@@ -266,11 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_ocr_verdict(ref)
         started = time.time()
         try:
-            out = vision_node({                     # ★ 现在直接调节点函数（不再是子图）
-                "device_id": args.device_id,
-                "alarm_code": args.alarm_code,
-                "image_refs": [str(ref)],
-            })
+            out = vision_node(_state_for(ref, args))   # ★ 直接调节点函数（不再是子图）
         except Exception as exc:  # noqa: BLE001 脚本兜底，便于一次跑完看全貌
             failed += 1
             print(f"  ✗ {type(exc).__name__}: {exc}")
@@ -280,52 +293,49 @@ def main(argv: list[str] | None = None) -> int:
                 break
             continue
 
-        text = out.get("visual_description") or ""
         elapsed = time.time() - started
-        findings = _as_findings(out.get("visual_findings"))
-        if not text.strip() or not findings.images:
+        vision = _vision_of(out)
+        text = vision.summary or ""
+
+        if not text.strip():
             failed += 1
             print(f"  ✗ {elapsed:.1f}s 返回为空（视作失败）")
-            report.append({"image": str(ref), "ok": False, "error": "空描述/空盒子"})
+            report.append({"image": str(ref), "ok": False, "error": "空 summary"})
             if args.fail_fast:
                 break
             continue
 
-        image = findings.images[0]
-        if image.natural_description.startswith(FAILED_PREFIX):
+        if vision.status == "FAILED":
             # 逐图兜底的产物：链路没崩，但这张图确实没识别成功 —— 仍算失败
             failed += 1
-            reason = image.limitations[0] if image.limitations else "未知原因"
-            print(f"  ✗ {elapsed:.1f}s 该图处理失败：{reason}")
-            report.append({"image": str(ref), "ok": False, "error": reason,
-                           "result": image.model_dump()})
+            print(f"  ✗ {elapsed:.1f}s 该图处理失败（status=FAILED）")
+            report.append({"image": str(ref), "ok": False, "error": "FAILED",
+                           "result": vision.model_dump()})
             if args.fail_fast:
                 break
             continue
 
         print(f"  ✓ {elapsed:.1f}s")
-        _print_image(image)
+        _print_findings(vision)
         print("  描述（给人看）:")
         _print_description(text)
         report.append({"image": str(ref), "ok": True, "seconds": round(elapsed, 1),
-                       "visual_description": text,
-                       "result": image.model_dump(),
-                       "未核验行数": text.count("本图未核验")})
+                       "status": vision.status,
+                       "summary": text,
+                       "findings": [f.model_dump() for f in vision.findings],
+                       "未核验行数": text.count("未核验汇总")})
 
     # ---------------- 汇总 ----------------
     ok = [r for r in report if r["ok"]]
     print("\n" + "=" * 78)
     print(f"汇总：成功 {len(ok)} / 失败 {failed}")
-    print(f"{'图片':44} {'状态':>6} {'观测':>4} {'abn':>4} {'字数':>6}")
+    print(f"{'图片':44} {'状态':>13} {'缺陷':>4} {'字数':>6}")
     for row, ref in zip(report, images):
         if not row["ok"]:
-            print(f"{ref.name:44} {'ERROR':>10} {row['error'][:40]}")
+            print(f"{ref.name:44} {'ERROR':>13} {row['error'][:40]}")
             continue
-        image = row["result"]
-        observations = image["observations"]
-        abnormal = sum(1 for o in observations if o["polarity"] == "abnormal")
-        print(f"{ref.name:44} {'OK':>6} {len(observations):>4} {abnormal:>4} "
-              f"{len(row['visual_description']):>6}")
+        print(f"{ref.name:44} {row['status']:>13} {len(row['findings']):>4} "
+              f"{len(row['summary']):>6}")
     print("=" * 78)
 
     if args.json:
