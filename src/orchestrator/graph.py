@@ -1,49 +1,57 @@
-# src/orchestrator/graph.py
-"""LangGraph 状态图定义（节点拓扑注册、App 编译）。
+"""CentriPump-PHM 诊断流程的 LangGraph 拓扑。"""
 
-本文件定义：
+from langgraph.graph import END, START, StateGraph
 
-  1. Step 2 —— 子图：取数+确定性计算 → 语义化（analyze + summarize 两节点；
-     **无私有字段**，直接用公共契约 ``DiagnosisState`` 当 state）
-  2. Step 3 —— **普通节点函数** ``vision_node``：读图 → OCR 辅助 → 视觉大模型
-     （没有私有状态、只有线性流程，所以不包子图；2026-09-17 精简）
-  3. ``build_main_graph()`` —— 主图串行挂载 Step 2 → Step 3。
-
-两个节点都有"缺输入就安全退出"的行为，所以主图不需要额外的条件边：
-  · ``image_refs`` 为空 → Step 3 一行日志直接返回；
-  · 没有时间窗口   → Step 2 两个节点各自软降级（不查库、不算、不调大模型）。
-"""
-from langgraph.graph import StateGraph, START, END
-
+from src.orchestrator.nodes import (
+    data_node,
+    engineer_text_node,
+    evidence_merge_node,
+    manual_node,
+    reasoner_node,
+    reporter_node,
+    router_node,
+    safety_guard_node,
+    # scada_fetch_node,
+    vision_node,
+)
 from src.schemas.state import DiagnosisState
-from src.sub_agents.data_agent.data_graph import data_agent_graph
-from src.sub_agents.vision_agent.vision_nodes import vision_node
 
 
-def build_main_graph(*, checkpointer=None):
-    """构建主图。主图状态是 ``DiagnosisState``（公共契约）。
+def build_diagnosis_graph():
+    """构建诊断主图。
 
-    参数：
-        checkpointer: 可选的状态持久化器（默认 None = 不持久化）。
-                      子图/节点都不需要自己的 checkpointer —— 挂在主图上时，
-                      持久化由主图这一层统一负责。
+    Router 完成输入拆分后，工程师文本、SCADA 时序数据、图片数据三路
+    独立处理；在证据合并后依次进入手册、推理、安全和报告阶段。
 
-    返回：
-        编译好的主图（``CompiledStateGraph``），可直接 ``.invoke(state_dict)``。
-
-    拓扑：
-        ``START → step2 → step3 → END``（串行；两个节点互相不依赖，可改并行）
+    Router 负责写入 route。SCADA 和 Vision 节点将来根据 route 自行跳过
+    不存在的输入，因此图的拓扑保持稳定，证据合并节点也不会等待缺失分支。
     """
-    main = StateGraph(DiagnosisState)
+    graph = StateGraph(DiagnosisState)
 
-    main.add_node("step2", data_agent_graph)
-    main.add_node("step3", vision_node)
+    graph.add_node("router", router_node)
+    graph.add_node("engineer_text", engineer_text_node)
+    # graph.add_node("scada_fetch", scada_fetch_node)
+    graph.add_node("data", data_node)
+    graph.add_node("vision", vision_node)
+    graph.add_node("evidence_merge", evidence_merge_node)
+    graph.add_node("manual", manual_node)
+    graph.add_node("reasoner", reasoner_node)
+    graph.add_node("safety_guard", safety_guard_node)
+    graph.add_node("reporter", reporter_node)
 
-    main.add_edge(START, "step2")
-    main.add_edge("step2", "step3")
-    main.add_edge("step3", END)
+    graph.add_edge(START, "router")
+    graph.add_edge("router", "engineer_text")
+    # graph.add_edge("router", "scada_fetch")
+    graph.add_edge("router", "vision")
+    graph.add_edge("router", "data")
+    graph.add_edge(
+        ["engineer_text", "data", "vision"],
+        "evidence_merge",
+    )
+    graph.add_edge("evidence_merge", "manual")
+    graph.add_edge("manual", "reasoner")
+    graph.add_edge("reasoner", "safety_guard")
+    graph.add_edge("safety_guard", "reporter")
+    graph.add_edge("reporter", END)
 
-    return main.compile(checkpointer=checkpointer)
-
-
-__all__ = ["data_agent_graph", "vision_node", "build_main_graph"]
+    return graph.compile()

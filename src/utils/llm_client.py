@@ -28,3 +28,4 @@ vision_model = init_chat_model(
     timeout=60,
     extra_body={"thinking": {"type": "disabled"}},
 )
+
