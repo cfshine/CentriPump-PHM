@@ -466,25 +466,7 @@ class ContextState(StateModel):
     # Step 1 Router 输出
     # -------------------------------------------------------------------------
 
-    route_reason: str = ""
-    """
-    Step 1 Router 的分诊理由。
-
-    注意：
-
-        route_reason != route_steps
-
-    本项目不需要额外维护：
-
-        route_steps = ["data", "vision", ...]
-
-    实际经过了哪些节点，LangGraph 的执行历史 / checkpoint
-    本身就是更可靠的来源。
-
-    这里只保留：
-
-        “为什么这么分诊”
-    """
+    # 新增修改，删除路由原因route_reason，不再进行分流，而是交由每个专家自行判断，给出数据情况描述
 
 
 # =============================================================================
@@ -1790,7 +1772,6 @@ def create_initial_state(
             alarm_code=alarm_code,
             user_query=user_query,
             image_refs=image_refs,
-            route_reason="",
         ),
 
         data=DataState(
