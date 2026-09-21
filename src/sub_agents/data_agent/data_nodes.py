@@ -3,21 +3,37 @@
 本文件只做「搬运」，不含业务算法：
   · 分段与规则判定   → src/sub_agents/data_agent/analyzer.py
   · 通用时序工具     → src/sub_agents/data_agent/timeseries_tools.py
-  · 取数（ORM/查询） → src/sub_agents/data_agent/repository.py
+  · 取数（ORM/查询） → src/sub_agents/data_agent/data_tools.py
   · 提示词           → configs/prompts/data_agent.yaml
 """
 from functools import lru_cache
+from typing import Literal
 
 import pandas as pd
 import yaml
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from src.sub_agents.data_agent.data_tools import query_scada_telemetry, query_alarm_events
-from src.sub_agents.data_agent.data_state import DataAgentState
-from src.utils.llm_client import model
+
+from rules.thresholds import DATA_COVERAGE_MIN_PCT, SAMPLE_INTERVAL_SEC
+from src.schemas.state import (
+    AlarmState,
+    DataDescription,
+    DataQuality,
+    DataState,
+    DiagnosisState,
+    TelemetryRef,
+)
+from src.sub_agents.data_agent.analyzer import _judge_flags, _segment_metrics
+from src.sub_agents.data_agent.data_tools import _parse_ts, query_scada_telemetry
+from src.sub_agents.data_agent.timeseries_tools import (
+    _extract_alarm_codes,
+    _format_overall,
+    _format_phases_for_llm,
+    _py,
+    render_rule_hits,
+)
 from src.utils.config_loader import PROJECT_PATH
-from src.sub_agents.data_agent.timeseries_tools import _py, _extract_alarm_codes, _format_alarm_events_for_llm, _format_overall, _format_phases_for_llm
-from src.sub_agents.data_agent.analyzer import _segment_metrics, _judge_flags
+from src.utils.llm_client import model
 
 #: 提示词模板路径（与代码解耦，改提示词不用动 Python）
 PROMPT_PATH = PROJECT_PATH / "configs" / "prompts" / "data_agent.yaml"
@@ -26,6 +42,9 @@ PROMPT_PATH = PROJECT_PATH / "configs" / "prompts" / "data_agent.yaml"
 @lru_cache(maxsize=1)
 def _load_prompt_template() -> ChatPromptTemplate:
     """载入 Step 2 的提示词模板。
+
+    返回：
+        ``ChatPromptTemplate``（system + user 两条消息）。
 
     用 lru_cache 缓存：提示词是静态资产，每次语义化都读一遍 YAML 没有意义。
     改完 YAML 重启进程即可生效。
@@ -37,133 +56,131 @@ def _load_prompt_template() -> ChatPromptTemplate:
     ])
 
 
+def _data_update(state: DiagnosisState, **updates) -> dict:
+    """把本次要改的字段合并进 ``state.data``，返回**只含 data 一个键**的回写字典。
+
+    参数：
+        state:   当前全局状态（读它现有的 data 盒子）。
+        updates: 本次要覆盖的 ``DataState`` 字段，如 ``quality=...`` / ``metrics=...``。
+
+    返回：
+        ``{"data": DataState}``。
+    """
+    return {"data": DataState.model_validate({**state.data.model_dump(), **updates})}
+
 
 # ==================== 大模型输出契约（Pydantic 严格的数据校验）====================
 
+class DescriptionOut(BaseModel):
+    """单条数据现象描述（LLM 输出用，字段与组长的 ``DataDescription`` 对齐）。
+
+    参数（由大模型填）：
+        type:        现象类别，六选一（见下列 Literal）
+        description: 该现象的自然语言描述；只能描述观测到的现象，禁止故障归因
+        evidence:    支撑该描述的指标名或规则码，如 ``['max_temp_de', 'slope_temp_de']``
+
+    说明：
+        这里是"大模型返回值"的契约；节点会把它映射成 ``DataDescription``，
+        并按白名单过滤 evidence（编造的指标名会被丢掉）。
+    """
+
+    type: Literal["TREND", "ANOMALY", "THRESHOLD", "CORRELATION", "ALARM", "OTHER"] = Field(
+        description="该现象的类别。"
+    )
+    description: str = Field(
+        min_length=1,
+        description="对数据现象的描述。只描述观测到的数据特征，不得进行故障归因。",
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="支撑该描述的指标名或规则码，例如 ['max_temp_de', 'slope_temp_de']。",
+    )
+
+
 class SemanticizeOutput(BaseModel):
-    """semanticize_node 的 LLM 输出契约。
-    区别（实测会踩的坑）：
-        JsonOutputParser   → LLM 漏字段返回 {}、类型写错（如 rag_search_queries
-                             返回字符串而非列表）都**静默通过**，下游 for 循环
-                             逐字符迭代，变成难查的隐性 bug。
-        with_structured_output → 上面两种情况直接抛 ValidationError，
-                             出错点明确，能被测试立刻发现。
-
-    用它之后，system prompt 里**不再需要手写 JSON 格式说明**，
-    schema 由 LangChain 自动注入，prompt 只讲业务规则。
+    """``summarize_node`` 的 LLM 输出契约：**多条**数据现象描述，按 type 分类。
     """
 
-    llm_description: str = Field(
-        ...,
-        description="按时间顺序的工况叙事描述。连续同状态段要合并，"
-                    "状态切换时刻必须提及，只写峰值与触发码、不复述数值表。"
-                    "长度与「发生的事件数」成比例：24 小时窗口不超过 1000 字。",
-    )
-    basic_judgment: str = Field(
-        ...,
-        description="1~3 句基础判断，指出关键异常时刻与所处阶段",
-    )
-    rag_search_queries: list[str] = Field(
-        ...,
-        min_length=3,
-        max_length=5,
-        description="3~5 条供 Step 4 RAG 检索用的检索词",
+    descriptions: list[DescriptionOut] = Field(
+        min_length=1,
+        max_length=6,
+        description="1~6 条数据现象描述，按现象分条（不是按阶段分条）。",
     )
 
 
-# ==================== 节点 1: 拉取数据 ====================
-
-def _has_window(state: DataAgentState) -> bool:
-    """判断本次调用**是否提供了时间窗口**（软降级的唯一判据）。
+def _evidence_whitelist(overall: dict, phases: list[dict], rule_codes: list[str]) -> set[str]:
+    """材料里真正出现过的指标名与规则码 —— 用来过滤大模型编造的 evidence。
 
     参数：
-        state: 子图状态；读 ``start_time`` 与 ``end_time``。
+        overall:    ``data.metrics["overall"]``（窗口概要与它的键名）
+        phases:     ``data.metrics["phases"]``（每段的指标键名）
+        rule_codes: ``data.threshold_flags``（规则码本身也可作为证据）
 
     返回：
-        True  = 起止时间都非空 → 正常做时序分析。
-        False = 缺任一个（或都是空串）→ 三个节点统一按"本次不做时序分析"处理。
-
-    为什么用这一个判据、而不是每处各判一次：
-        三个节点（取数 / 计算 / 语义化）必须**做出同样的判断**，否则会出现
-        "取数跳过了、语义化却照调大模型"这种半截状态。集中成一个函数最不容易漂移。
+        可接受的 evidence 名字集合。
     """
-    return bool(
-        str(state.get("start_time") or "").strip()
-        and str(state.get("end_time") or "").strip()
-    )
+    allowed = set(overall)
+    for ph in phases:
+        allowed.update(ph)
+    allowed.update(rule_codes)
+    return allowed
 
 
-def fetch_data_node(state: DataAgentState):
-    """节点1：取时间窗口内的原始遥测。
+# ==================== 节点 1: 取数 + 确定性计算 ====================
+
+def analyze_node(state: DiagnosisState) -> dict:
+    """节点1：取时间窗口内的原始遥测，并做确定性计算（纯 pandas，无大模型）。
 
     参数：
-        state: 子图状态；读 ``device_id`` / ``start_time`` / ``end_time``。
+        state: 全局状态；读 ``state.context`` 的 device_id / start_time / end_time / trace_id。
 
     返回：
-        正常 → ``{"raw_telemetry_data": [ ...每帧一条 dict... ]}``（私有字段，不外流）
-        软降级 → ``{"raw_telemetry_data": []}`` —— **不查库**
-
-    ★ 软降级（2026-09-17 用户拍板）：
-        未提供时间窗口时**直接返回空列表，不做任何数据库查询**。
-        以前空窗口会一路走到 ``_parse_ts`` 抛 ``ValueError: Invalid isoformat string: ''``，
-        把整张 LangGraph 掀翻（实测：只给图片路径的输入会让主图整体失败，
-        连与 Step 2 完全无关的 Step 3 都轮不到执行）。
-        现在它安全退出，把"这次没做时序分析"交给下游两个节点显式表达。
+        ``{"data": DataState}``，三种出口：
+          正常         → quality=OK，metrics / threshold_flags / alarms / telemetry_ref 全部填好
+          没有时间窗口 → quality=EMPTY + reason（**不查库**）
+          窗口内无数据 → quality=EMPTY + reason
     """
-    if not _has_window(state):
-        print("[Node 1] 未提供时间窗口 → 跳过时序取数（本次不做时序分析）")
-        return {"raw_telemetry_data": []}
-
-    print(f"[Node 1] 拉取 {state['device_id']} 在 {state['start_time']} ~ {state['end_time']} 的数据")
-    data = query_scada_telemetry(
-        state["device_id"], state["start_time"], state["end_time"]
+    ctx = state.context
+    telemetry_ref = TelemetryRef(
+        source="scada_db.scada_telemetry",
+        trace_id=ctx.trace_id,
+        device_id=ctx.device_id,
+        start_time=ctx.start_time,
+        end_time=ctx.end_time,
     )
-    print(f"[Node 1] 获取到 {len(data)} 条记录")
-    return {"raw_telemetry_data": data}
 
+    if not (ctx.start_time.strip() and ctx.end_time.strip()):
+        print("[analyze] 未提供时间窗口 → 跳过取数与计算（本次不做时序分析）")
+        return _data_update(
+            state,
+            telemetry_ref=telemetry_ref,
+            quality=DataQuality(status="EMPTY", total_points=0,
+                                reason="未提供时间窗口：本次未做时序分析"),
+            metrics={}, threshold_flags=[], alarms=AlarmState(),
+        )
 
-# ==================== 节点 2: 分段确定性计算 ====================
+    print(f"[analyze] 拉取 {ctx.device_id} 在 {ctx.start_time} ~ {ctx.end_time} 的数据")
+    raw = query_scada_telemetry(ctx.device_id, ctx.start_time, ctx.end_time)
+    print(f"[analyze] 获取到 {len(raw)} 条记录")
 
-def calculate_metrics_node(state: DataAgentState):
-    """节点2：分段统计 + 分段告警判定（纯 pandas，无数据库/大模型依赖）。
-
-    参数：
-        state: 子图状态；读 ``raw_telemetry_data`` 与 ``alarm_code``。
-
-    返回：
-        正常 → 五个公共字段（``calculated_metrics`` / ``threshold_flags`` /
-               ``effective_alarm_codes`` / ``last_alarm_codes`` / ``all_alarm_codes_in_window``）
-        无数据 → 空指标 + 一条"**未提供时间窗口：本次未做时序分析**"告警
-    """
-    if not _has_window(state):
-        print("[Node 2] 未提供时间窗口 → 跳过确定性计算（本次不做时序分析）")
-        return {
-            "calculated_metrics": {},
-            "threshold_flags": ["未提供时间窗口：本次未做时序分析"],
-            "effective_alarm_codes": state.get("alarm_code", "") or "NONE",
-            "last_alarm_codes": "NONE",
-            "all_alarm_codes_in_window": [],
-        }
-
-    print("[Node 2] 开始确定性计算（分段统计）")
-
-    df = pd.DataFrame(state["raw_telemetry_data"])
+    df = pd.DataFrame(raw)
     if df.empty:
-        return {
-            "calculated_metrics": {},
-            "threshold_flags": ["无数据：指定时间窗口内无 SCADA 记录"],
-            "effective_alarm_codes": state.get("alarm_code", "") or "NONE",
-        }
+        return _data_update(
+            state,
+            telemetry_ref=telemetry_ref,
+            quality=DataQuality(status="EMPTY", total_points=0,
+                                reason="指定时间窗口内无 SCADA 记录"),
+            metrics={}, threshold_flags=[], alarms=AlarmState(),
+        )
 
+    print("[analyze] 开始确定性计算（分段统计 + 规则判定）")
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.sort_values('timestamp').reset_index(drop=True)
 
-    # 提取报警码（返回三元组）
-    effective, last, all_codes = _extract_alarm_codes(
-        df, fallback_alarm_code=state.get("alarm_code", "")
-    )
+    # —— 1. 窗口内的报警码三件套（只认数据，不认用户入参）
+    effective, last, all_codes = _extract_alarm_codes(df)
 
-    # —— 1. 分段：按 operating_state 变化切段
+    # —— 2. 分段：按 operating_state 变化切段
     df['_seg_id'] = (df['operating_state'] != df['operating_state'].shift()).cumsum()
 
     phases = []
@@ -172,10 +189,10 @@ def calculate_metrics_node(state: DataAgentState):
         ph["state"] = seg['operating_state'].iloc[0]
         phases.append(ph)
 
-    # —— 2. 分段阈值判定
-    flags = _judge_flags(phases)
+    # —— 3. 分段规则判定：命中的**机器码**写回各段 rule_hits，并返回窗口级去重码
+    rule_codes = _judge_flags(phases)
 
-    # —— 3. 全局概要
+    # —— 4. 全局概要（报警码不在这里，改由 data.alarms 单一出处）
     overall = {
         "total_points": int(len(df)),
         "window_start": df['timestamp'].iloc[0].isoformat(),
@@ -188,124 +205,104 @@ def calculate_metrics_node(state: DataAgentState):
         "max_vib_de_overall": _py(df['vib_rms_de'].max(), 2),
         "max_temp_nde_overall": _py(df['temp_nde'].max(), 1),
         "max_vib_nde_overall": _py(df['vib_rms_nde'].max(), 2),
-        "effective_alarm_codes": effective,
-        "last_alarm_codes": last,
-        "all_alarm_codes_in_window": all_codes,
     }
 
-    metrics = {"overall": overall, "phases": phases}
+    # —— 5. 数据完整性：窗口里本该有多少点 vs 实际拿到多少点 ——
+    window_sec = (_parse_ts(ctx.end_time) - _parse_ts(ctx.start_time)).total_seconds()
+    expected_points = int(window_sec // SAMPLE_INTERVAL_SEC) + 1
+    coverage_pct = len(df) / expected_points * 100 if expected_points > 0 else 100.0
+    if coverage_pct < DATA_COVERAGE_MIN_PCT:
+        quality = DataQuality(
+            status="PARTIAL", total_points=int(len(df)),
+            reason=f"窗口内缺失约 {100 - coverage_pct:.0f}% 的数据"
+                   f"（理论 {expected_points} 点，实际 {len(df)} 点）",
+        )
+    else:
+        quality = DataQuality(status="OK", total_points=int(len(df)), reason="")
 
-    print(f"[Node 2] 识别 {len(phases)} 个阶段，触发 {len(flags)} 条阈值告警")
-    print(f"[Node 2] 全量报警码: {effective}")
-    print(f"[Node 2] 最后一次报警码: {last}")
+    print(f"[analyze] 识别 {len(phases)} 个阶段，命中 {len(rule_codes)} 种规则: {rule_codes}")
+    print(f"[analyze] 窗口内报警码: {effective}")
+    print(f"[analyze] 数据质量: {quality.status}（覆盖率 {coverage_pct:.0f}%）")
 
-    return {
-        "calculated_metrics": metrics,
-        "threshold_flags": flags,
-        "effective_alarm_codes": effective,      
-        "last_alarm_codes": last,                
-        "all_alarm_codes_in_window": all_codes,  
-    }
+    return _data_update(
+        state,
+        telemetry_ref=telemetry_ref,
+        quality=quality,
+        metrics={"overall": overall, "phases": phases},
+        threshold_flags=rule_codes,
+        alarms=AlarmState(effective=effective, last=last, all=all_codes),
+    )
 
 
-# ==================== 节点 3: LLM 语义化 ====================
-def semanticize_node(state: DataAgentState):
-    """节点3：LLM 语义化 + 按需核验报警事件。
+# ==================== 节点 2: LLM 语义化 ====================
+
+def summarize_node(state: DiagnosisState) -> dict:
+    """节点2：把 Python 算好的数字交给大模型，产出数据现象描述（写进 ``data.descriptions``）。
 
     参数：
-        state: 子图状态；读 ``calculated_metrics`` / ``threshold_flags`` /
-               ``all_alarm_codes_in_window`` / ``device_id`` / 时间窗口。
+        state: 全局状态；读 ``state.context``（提示词用）与 ``state.data``（材料）。
 
     返回：
-        正常 → ``llm_description`` / ``basic_judgment`` / ``rag_search_queries``
-               + 私有字段 ``alarm_events``（不回流的报警段）
-        软降级 → 同样的四个键，但内容是**确定性模板**，且**不调用大模型**
-
-    ★ 软降级（2026-09-17 用户拍板）：
-        未提供时间窗口时，既不核验报警事件（那也要窗口）、也不调大模型
-        （没有指标可讲，调了只会得到一段没信息量的话，还白花钱）。
-        返回的文本明确写出"本次未做时序分析"，让 Step 4/7 知道这是**没做**，
-        而不是"做了但没发现异常"。
+        正常          → ``{"data": DataState}``，``descriptions`` 里装 1~6 条按 type 分类的现象描述
+        没窗口 / 没数据 → ``{}``（什么都不写，也**不调大模型**）
     """
-    if not _has_window(state):
-        print("[Node 3] 未提供时间窗口 → 跳过语义化（不调用大模型）")
-        return {
-            "llm_description": "未提供时间窗口：本次未做时序分析，无工况描述。",
-            "basic_judgment": "未提供时间窗口，Step 2 未执行时序分析（未取数、未调用大模型）。",
-            "rag_search_queries": [],
-            "alarm_events": [],
-        }
+    ctx = state.context
+    if not (ctx.start_time.strip() and ctx.end_time.strip()):
+        print("[summarize] 未提供时间窗口 → 跳过语义化（不调用大模型）")
+        return {}
 
-    print("[Node 3] 调用大模型生成语义化描述")
+    data = state.data
+    if data.quality.status == "EMPTY":
+        print(f"[summarize] 数据质量 {data.quality.status} → 跳过语义化（不调用大模型）")
+        return {}
 
-    metrics = state.get("calculated_metrics", {})
-    phases = metrics.get("phases", [])
-    overall = metrics.get("overall", {})
-    has_alarm = bool(state.get("all_alarm_codes_in_window"))
+    phases = data.metrics.get("phases", [])
+    overall = data.metrics.get("overall", {})
 
-    # —— 判断是否需要核验报警事件
-    alarm_events = []
-    if has_alarm:
-        print("[Node 3] 检测到报警码，调用 query_alarm_events 核验报警时刻")
-        try:
-            alarm_events = query_alarm_events(
-                state["device_id"], state["start_time"], state["end_time"]
-            )
-            print(f"[Node 3] 核验到 {len(alarm_events)} 条报警事件")
-        except Exception as e:
-            print(f"[Node 3] 报警事件查询失败: {e}")
+    # 阈值命中材料：把机器码渲染成中文事实句给大模型看（渲染只发生在这里，不进 state）
+    rule_hits_text = render_rule_hits(phases)
 
-    # —— 把报警事件格式化为 LLM 输入文本
-    alarm_events_text = _format_alarm_events_for_llm(alarm_events)
-
-    # —— 构造 Prompt（报警码仍不直接注入系统提示，但事件数据作为"用户材料"传入）
     prompt = _load_prompt_template()
-
     chain = prompt | model.with_structured_output(SemanticizeOutput)
 
     result: SemanticizeOutput = chain.invoke({
-        "device_id": state["device_id"],
-        "time_window": f"{state['start_time']} ~ {state['end_time']}",
+        "device_id": ctx.device_id,
+        "time_window": f"{ctx.start_time} ~ {ctx.end_time}",
         "overall_summary": _format_overall(overall),
         "phases_text": _format_phases_for_llm(phases),
-        "alarm_events_section": alarm_events_text,   # 为空时返回 ""
-        "flags": "\n".join(f"- {f}" for f in state["threshold_flags"]) or "无",
+        "flags": rule_hits_text,
     })
 
-    # ★ with_structured_output 在「解析失败」时返回 None（最常见原因是输出被
-    #   max_tokens 截断）。这里给一句能直接定位问题的报错，而不是让下游抛出
-    #   莫名其妙的 'NoneType' object has no attribute 'llm_description'。
     if result is None:
         raise RuntimeError(
             "大模型结构化输出解析失败（返回 None）；通常是输出被 max_tokens 截断，"
             "请调大 src/utils/llm_client.py 里的 max_tokens，或收紧提示词的长度要求"
         )
 
-    # 软预警：超长时打印日志，不截断（保留完整信息）
-    desc = result.llm_description or ""
+    # 映射成大模型的返回值 → 过滤掉编造的 evidence
+    allowed_evidence = _evidence_whitelist(overall, phases, data.threshold_flags)
+    descriptions = [
+        DataDescription(
+            type=d.type,
+            description=d.description,
+            evidence=[e for e in d.evidence if e in allowed_evidence],
+        )
+        for d in result.descriptions
+    ]
+    if any(not d.description.strip() for d in descriptions):
+        raise RuntimeError("大模型返回了空描述；请检查提示词或 max_tokens 设置")
 
-    # 预警线：按**事件数**算，而不是阶段数。
-    # ★ 阶段数分级太粗 —— 一个"只有 2 段、但报警码升级了 19 次"的窗口，
-    #   事件一点不少，却会被 500 字的固定线卡住（实测 A2 窗口写 525 字被误报）。
-    #   事件数 = 状态切换次数 + 报警段数，二者都是"这段窗口里发生了多少事"的直接度量。
-    #   实测标定：A2 窗口（1 次切换 + 18 段报警）同一份输入多次调用写 545~650 字
-    #            （temperature=0 也有 ±50 字的波动）；24h 窗口（9 次切换 + 30 段）写 707~810 字。
-    #   取 500 + 40×切换 + 10×段 —— 两者分别得 720 与 1160(封顶 1000)，
-    #   都按实测**上沿**留了余量，不会因为几十字的正常波动就误报。
-    phase_count = len(phases)
-    state_switches = max(0, phase_count - 1)
-    alarm_runs = len(alarm_events)
-    warn_threshold = min(1000, 500 + 40 * state_switches + 10 * alarm_runs)
-    if len(desc) > warn_threshold:
+    # 预警线：按**事件数**算（口径见 README；这条只是日志提醒，不影响断言）
+    state_switches = max(0, len(phases) - 1)
+    codes = data.alarms.effective
+    alarm_code_count = 0 if codes in ("", "NONE") else len([c for c in codes.split(";") if c.strip()])
+    warn_threshold = min(1000, 500 + 40 * state_switches + 20 * alarm_code_count)
+    total_len = sum(len(d.description) for d in descriptions)
+    if total_len > warn_threshold:
         print(
-            f"[Node 3] ⚠ LLM 描述较长 ({len(desc)} 字，"
-            f"{state_switches} 次状态切换 + {alarm_runs} 段报警 → 预警线 {warn_threshold})，"
+            f"[summarize] ⚠ LLM 描述较长 ({total_len} 字 / {len(descriptions)} 条，"
+            f"{state_switches} 次状态切换 + {alarm_code_count} 种报警码 → 预警线 {warn_threshold})，"
             f"请检查是否违反'连续同状态段合并'原则"
         )
 
-    return {
-        "llm_description": result.llm_description,
-        "basic_judgment": result.basic_judgment,
-        "rag_search_queries": result.rag_search_queries,
-        "alarm_events": alarm_events,
-    }
+    return _data_update(state, descriptions=descriptions)

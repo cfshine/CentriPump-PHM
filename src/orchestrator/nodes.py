@@ -88,136 +88,37 @@ def engineer_text_node(state: DiagnosisState) -> dict:
 
 
 def data_node(state: DiagnosisState) -> dict:
-    """
-    Step 3：时序数据分析。
+    logger.info("数据处理开始")
 
-    当前阶段只负责判断是否具备基础数据上下文。
+    # 延迟导入：本模块会被主图导入，而子 Agent 会连带初始化大模型客户端
+    from src.sub_agents.data_agent.data_graph import run_data_agent
+    result = run_data_agent(state)
 
-    真正实现后：
+    logger.info("数据处理结束")
 
-        device_id
-        start_time
-        end_time
-            ↓
-        SCADA 查询
-            ↓
-        Data Agent
-            ↓
-        DataState
-    """
-
-    context = state.context
-
-    # -------------------------------------------------------------------------
-    # 没有设备或时间窗口。
-    #
-    # 不报错。
-    #
-    # 这是一个合法的“没有时序数据输入”的诊断场景。
-    # -------------------------------------------------------------------------
-
-    if not all(
-        value.strip()
-        for value in (
-            context.device_id,
-            context.start_time,
-            context.end_time,
-        )
-    ):
-        logger.info("缺少设备或时间窗口，时序数据分析降级")
-        # TODO:
-        #
-        # 当前 DataState 的 quality 可以记录：
-        #
-        #     status = "EMPTY"
-        #     reason = "缺少设备或时间窗口"
-        #
-        # 但如果直接返回：
-        #
-        #     {"data": {"quality": ...}}
-        #
-        # 需要确认你当前 LangGraph + Pydantic State
-        # 的嵌套更新策略。
-        #
-        # 先保持最小实现。
-        return {}
-
-    # TODO:
-    #
-    # 正式实现：
-    #
-    # 1. 查询 SCADA
-    # 2. 判断数据是否为空 / 部分缺失
-    # 3. 计算 metrics
-    # 4. threshold_flags
-    # 5. alarms
-    # 6. descriptions
-    #
-    # return {
-    #     "data": ...
-    # }
-
-    logger.info("开始时序数据分析")
-    return {}
-
-
-# =============================================================================
-# Step 4
-# =============================================================================
+    return result
 
 
 def vision_node(state: DiagnosisState) -> dict:
+
     """
-    Step 4：现场图片分析。
+    提取图片故障特征。
+    参数：
+        state: 全局状态；Step 3 读 ``state.context.image_refs`` 与 device_id / alarm_code。
 
-    没有图片是合法状态，不是异常。
-
-        image_refs == []
-            ↓
-        NO_IMAGE
-
-    有图片但没有发现缺陷：
-
-        NO_DEFECT
-
-    图片分析执行失败：
-
-        FAILED
+    返回：
+        ``{"vision": VisionState}`` —— 只回写 vision 一个盒子。
     """
 
-    # -------------------------------------------------------------------------
-    # 没有图片。
-    #
-    # 当前阶段暂时没有修改 VisionState，
-    # 正式实现时应该写：
-    #
-    #     status = "NO_IMAGE"
-    #
-    # -------------------------------------------------------------------------
+    logger.info("视觉处理开始")
 
-    if not state.context.image_refs:
-        logger.info("未提供现场图片，视觉分析降级")
-        return {}
+    # 延迟导入：同上，避免主图 import 本模块时就初始化大模型客户端
+    from src.sub_agents.vision_agent.vision_nodes import vision_node as run_vision_agent
+    result = run_vision_agent(state)
 
-    # TODO:
-    #
-    # 正式实现：
-    #
-    # findings = vision_agent.analyze(
-    #     state.context.image_refs
-    # )
-    #
-    # return {
-    #     "vision": ...
-    # }
+    logger.info("视觉处理结束")
 
-    logger.info("开始视觉分析")
-    return {}
-
-
-# =============================================================================
-# Evidence Merge
-# =============================================================================
+    return result
 
 
 def evidence_merge_node(state: DiagnosisState) -> dict:
