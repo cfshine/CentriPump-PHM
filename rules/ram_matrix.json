@@ -1,6 +1,62 @@
 {
-  "_comment": "【占位】Step 6 RAM 风险矩阵配置表：风险等级映射、高危设备黑名单",
-  "_owner": "Step 6 负责人",
-  "risk_levels": {},
-  "high_risk_devices": []
+  "_comment": "CentriPump-PHM Step 6 RAM (Reliability, Availability, Maintainability) 风险矩阵与高危资产配置",
+  "version": "1.0.0",
+  "high_risk_devices": [
+    "PUMP-A01-HEAVY-OIL",
+    "PUMP-MAIN-CIRC-01",
+    "PUMP-IS100-80-160-CRITICAL",
+    "PUMP-HIGH-PRESSURE-01"
+  ],
+  "trip_rules": [
+    "BEARING_TEMP_DE_TRIP",
+    "BEARING_TEMP_DE_RAMP_SHARP",
+    "VIB_DE_TRIP",
+    "VIB_NDE_TRIP",
+    "PRESS_IN_TRIP"
+  ],
+  "warn_rules": [
+    "BEARING_TEMP_DE_WARN",
+    "BEARING_TEMP_DE_RAMP_SLOW",
+    "VIB_DE_WARN",
+    "VIB_NDE_WARN",
+    "VIB_BOTH_HIGH",
+    "VIB_DE_DOMINANT",
+    "VIB_NDE_DOMINANT",
+    "CURRENT_HIGH",
+    "CURRENT_LOW",
+    "PRESS_IN_LOW",
+    "PRESS_OUT_DEV",
+    "FLOW_DEV",
+    "CV_UNSTABLE"
+  ],
+  "risk_matrix": {
+    "CRITICAL": {
+      "level": "CRITICAL",
+      "name": "一级特级风险（灾难性破坏先兆）",
+      "default_decision": "BLOCK",
+      "sla_hours": 0.25,
+      "description": "越过停机红线、急剧恶化温升、易燃有毒介质严重泄漏或气蚀拉穿，需立即紧急停机防范人身与重大设备事故。"
+    },
+    "HIGH": {
+      "level": "HIGH",
+      "name": "二级重大风险（关键部件异常恶化）",
+      "default_decision": "MANUAL_REVIEW",
+      "sla_hours": 4.0,
+      "description": "越过预警线、高危核心设备异常、严重振动超标或多源证据冲突，需4小时内就地核查并人工签审。"
+    },
+    "MEDIUM": {
+      "level": "MEDIUM",
+      "name": "三级中度风险（工况轻度劣化）",
+      "default_decision": "MANUAL_REVIEW",
+      "sla_hours": 24.0,
+      "description": "工况漂移、缓慢劣化、非关键部位渗漏，置信度高时可放行，否则转人工排班检修。"
+    },
+    "LOW": {
+      "level": "LOW",
+      "name": "四级轻微风险（正常波动）",
+      "default_decision": "PASS",
+      "sla_hours": 72.0,
+      "description": "测点轻微波动或无可见缺陷，设备运行状态良好，可自动放行闭环。"
+    }
+  }
 }
