@@ -470,6 +470,35 @@ class ContextState(StateModel):
 
 
 # =============================================================================
+# 二点五、EngineerText —— Step 2 工程师文本
+# =============================================================================
+
+
+class EngineerTextState(StateModel):
+    """
+    Step 2 工程师文本处理状态。
+    """
+
+    status: Literal[
+        "PENDING",
+        "EMPTY",
+        "RECORDED",
+    ] = "PENDING"
+    """
+    状态：
+        PENDING: 待处理
+        EMPTY: 未提供工程师文本
+        RECORDED: 已记录工程师文本
+    """
+
+    text: str = ""
+    """工程师文本原文。"""
+
+    summary: str = ""
+    """工程师文本摘要说明。"""
+
+
+# =============================================================================
 # 三、Data —— Step 2 时序数据分析
 # =============================================================================
 
@@ -1591,6 +1620,14 @@ class DiagnosisState(StateModel):
     )
 
     # -------------------------------------------------------------------------
+    # 1.5. Step 2 工程师文本
+    # -------------------------------------------------------------------------
+
+    engineer_text: EngineerTextState = Field(
+        default_factory=EngineerTextState,
+    )
+
+    # -------------------------------------------------------------------------
     # 2. Step 2 数据分析
     # -------------------------------------------------------------------------
 
@@ -1772,6 +1809,12 @@ def create_initial_state(
             alarm_code=alarm_code,
             user_query=user_query,
             image_refs=image_refs,
+        ),
+
+        engineer_text=EngineerTextState(
+            status="PENDING",
+            text="",
+            summary="",
         ),
 
         data=DataState(

@@ -11,7 +11,17 @@ CentriPump-PHM 的 LangGraph 节点。
         现在仅仅作为启动项, 比如日志的开始
 """
 
-from src.schemas.state import DiagnosisState
+from datetime import datetime, timedelta
+
+from src.schemas.state import (
+    AlarmState,
+    DataQuality,
+    DataState,
+    DiagnosisState,
+    EngineerTextState,
+    TelemetryRef,
+    VisionState,
+)
 from src.core.logger import get_logger
 
 
@@ -24,8 +34,27 @@ logger = get_logger(__name__)
 
 
 def start_node(state: DiagnosisState) -> dict:
+    """
+    Step 1：流程启动节点。
+    完成基础环境检查与初始化，若未提供时间窗口，默认补充为当前时间往前半小时。
+    """
     logger.info("诊断流程开始")
-    return {}
+    ctx = state.context
+    updates = {}
+
+    # 检测时间窗口：如果不存在，默认从当前时间往前半个小时
+    start_time = (ctx.start_time or "").strip()
+    end_time = (ctx.end_time or "").strip()
+    if not (start_time and end_time):
+        now = datetime.now().replace(microsecond=0)
+        default_start = (now - timedelta(minutes=30)).isoformat()
+        default_end = now.isoformat()
+        logger.info("检测到时间窗口不存在，设置默认时间窗口: %s ~ %s", default_start, default_end)
+        updates["context"] = ctx.model_copy(
+            update={"start_time": default_start, "end_time": default_end}
+        )
+
+    return updates
 
 
 # =============================================================================
@@ -37,49 +66,41 @@ def engineer_text_node(state: DiagnosisState) -> dict:
     """
     Step 2：工程师文本处理。
 
-    当前阶段暂时不接入 LLM。
-
-    如果没有用户文本，则记录为空输入。
-
-    后续正式实现时，可以在这里：
-
-        context.user_query
-            ↓
-        Engineer Text Agent
-            ↓
-        engineer_text
+    检测是否存在工程师描述：
+    - 若不存在描述：更新 state 为无描述 (EMPTY)，并决定跳过后续文本分析；
+    - 若存在描述：记录输入内容并更新 state 为 RECORDED。
     """
+    query = (state.context.user_query or "").strip()
+    if not query:
+        logger.info("未检测到描述，记录为无描述 (EMPTY)，跳过后续文本分析")
+        return {
+            "engineer_text": EngineerTextState(
+                status="EMPTY",
+                text="",
+                summary="无描述：未提供工程师描述文本",
+            )
+        }
 
-    if not state.context.user_query.strip():
-        logger.info("未提供工程师文本，记录为空输入")
-        # ---------------------------------------------------------------------
-        # 当前 DiagnosisState 中暂时没有 engineer_text 专属区域。
-        #
-        # 所以当前阶段不新增 State 字段，只通过空返回表示：
-        #
-        #     没有工程师文本
-        #
-        # 等你正式确定 EngineerTextState 后，
-        # 再写入：
-        #
-        #     engineer_text.status = "EMPTY"
-        #
-        # ---------------------------------------------------------------------
-        return {}
-
-    # TODO:
-    # 后续在这里调用工程师文本 Agent。
-    #
-    # 例如：
-    #
-    # result = engineer_text_agent(...)
-    #
-    # return {
-    #     "engineer_text": result
-    # }
-
-    logger.info("开始处理工程师文本")
-    return {}
+    logger.info("检测到工程师描述 (长度: %d 字符)，开始处理", len(query))
+    try:
+        logger.info("工程师文本记录成功: %s", query[:50] + ("..." if len(query) > 50 else ""))
+        logger.info("工程师文本处理完成")
+        return {
+            "engineer_text": EngineerTextState(
+                status="RECORDED",
+                text=query,
+                summary=query,
+            )
+        }
+    except Exception as exc:
+        logger.exception("工程师文本处理异常: %s", exc)
+        return {
+            "engineer_text": EngineerTextState(
+                status="EMPTY",
+                text="",
+                summary=f"工程师文本处理异常: {type(exc).__name__}",
+            )
+        }
 
 
 # =============================================================================
@@ -88,35 +109,153 @@ def engineer_text_node(state: DiagnosisState) -> dict:
 
 
 def data_node(state: DiagnosisState) -> dict:
-    logger.info("数据处理开始")
+    """
+    Step 3：时序数据分析。
 
-    # 延迟导入：本模块会被主图导入，而子 Agent 会连带初始化大模型客户端
-    from src.sub_agents.data_agent.data_graph import run_data_agent
-    result = run_data_agent(state)
+    检测是否存在设备号与时间窗口：
+    - 若不存在设备号：记录为无设备码 (EMPTY)，并决定跳过后续 SCADA 数据查询与分析；
+    - 若时间窗口不存在：兜底使用当前时间往前半小时作为默认窗口；
+    - 若设备号存在：调用 Data Agent 子图拉取 SCADA 时序数据并计算指标，回写 data 盒子。
+    """
+    ctx = state.context
+    device_id = (ctx.device_id or "").strip()
 
-    logger.info("数据处理结束")
+    # 解析时间窗口（若缺失则兜底为当前时间往前半小时）
+    start_time = (ctx.start_time or "").strip()
+    end_time = (ctx.end_time or "").strip()
+    if not (start_time and end_time):
+        now = datetime.now().replace(microsecond=0)
+        start_time = (now - timedelta(minutes=30)).isoformat()
+        end_time = now.isoformat()
+        logger.info("未提供时间窗口，使用默认时间窗口 (往前半小时): %s ~ %s", start_time, end_time)
+
+    # 检测是否存在设备号
+    if not device_id:
+        logger.warning("未检测到设备号，记录为无设备码 (EMPTY)，跳过后续数据分析")
+        telemetry_ref = TelemetryRef(
+            source="scada_db.scada_telemetry",
+            trace_id=ctx.trace_id,
+            device_id="",
+            start_time=start_time,
+            end_time=end_time,
+        )
+        quality = DataQuality(
+            status="EMPTY",
+            total_points=0,
+            reason="无设备码：未提供设备编号，跳过时序数据分析",
+        )
+        return {
+            "data": DataState(
+                telemetry_ref=telemetry_ref,
+                quality=quality,
+                metrics={},
+                threshold_flags=[],
+                alarms=AlarmState(effective="NONE", last="NONE", all=[]),
+                descriptions=[],
+            )
+        }
+
+    logger.info("时序数据分析开始: 设备=%s, 时间窗口=%s ~ %s", device_id, start_time, end_time)
+
+    # 构造带有完整时间窗口的状态传入子图
+    state_to_run = state
+    if ctx.start_time != start_time or ctx.end_time != end_time:
+        state_to_run = state.model_copy(
+            update={"context": ctx.model_copy(update={"start_time": start_time, "end_time": end_time})}
+        )
+
+    try:
+        # 延迟导入：本模块会被主图导入，而子 Agent 会连带初始化数据库及大模型客户端
+        from src.sub_agents.data_agent.data_graph import run_data_agent
+
+        result = run_data_agent(state_to_run)
+    except Exception as exc:
+        logger.exception("时序数据分析失败: %s", exc)
+        telemetry_ref = TelemetryRef(
+            source="scada_db.scada_telemetry",
+            trace_id=ctx.trace_id,
+            device_id=device_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        quality = DataQuality(
+            status="EMPTY",
+            total_points=0,
+            reason=f"时序数据处理异常降级: {type(exc).__name__}",
+        )
+        return {
+            "data": DataState(
+                telemetry_ref=telemetry_ref,
+                quality=quality,
+                metrics={},
+                threshold_flags=[],
+                alarms=AlarmState(effective="NONE", last="NONE", all=[]),
+                descriptions=[],
+            )
+        }
+
+    data = result.get("data")
+    if data:
+        quality_status = getattr(data.quality, "status", "UNKNOWN")
+        flags_count = len(data.threshold_flags) if data.threshold_flags else 0
+        desc_count = len(data.descriptions) if data.descriptions else 0
+        logger.info(
+            "时序数据分析完成: 质量状态=%s, 触发规则数=%d, 现象描述数=%d",
+            quality_status,
+            flags_count,
+            desc_count,
+        )
+    else:
+        logger.info("时序数据分析完成 (无返回数据)")
 
     return result
 
 
 def vision_node(state: DiagnosisState) -> dict:
-
     """
-    提取图片故障特征。
-    参数：
-        state: 全局状态；Step 3 读 ``state.context.image_refs`` 与 device_id / alarm_code。
+    Step 3：现场图片故障特征分析。
 
-    返回：
-        ``{"vision": VisionState}`` —— 只回写 vision 一个盒子。
+    检测是否存在现场图片：
+    - 若不存在图片：记录为无图片 (NO_IMAGE)，并决定跳过后续视觉大模型分析；
+    - 若存在图片：调用 Vision Agent 逐图执行预处理、OCR 辅助与视觉大模型分析，回写 vision 盒子。
     """
+    image_refs = state.context.image_refs or []
+    if not image_refs:
+        logger.info("未检测到图片，记录为无图片 (NO_IMAGE)，跳过后续视觉分析")
+        return {
+            "vision": VisionState(
+                status="NO_IMAGE",
+                findings=[],
+                summary="无图片：未提供现场图片，跳过视觉分析",
+            )
+        }
 
-    logger.info("视觉处理开始")
+    logger.info("检测到 %d 张图片，开始视觉分析", len(image_refs))
+    try:
+        # 延迟导入：避免主图 import 本模块时连带初始化大模型客户端
+        from src.sub_agents.vision_agent.vision_nodes import vision_node as run_vision_agent
 
-    # 延迟导入：同上，避免主图 import 本模块时就初始化大模型客户端
-    from src.sub_agents.vision_agent.vision_nodes import vision_node as run_vision_agent
-    result = run_vision_agent(state)
+        result = run_vision_agent(state)
+    except Exception as exc:
+        logger.exception("视觉分析失败: %s", exc)
+        return {
+            "vision": VisionState(
+                status="FAILED",
+                findings=[],
+                summary=f"视觉分析异常降级: {type(exc).__name__}",
+            )
+        }
 
-    logger.info("视觉处理结束")
+    vision = result.get("vision")
+    if vision:
+        findings_count = len(vision.findings) if vision.findings else 0
+        logger.info(
+            "视觉分析完成: 状态=%s, 检出缺陷数=%d",
+            vision.status,
+            findings_count,
+        )
+    else:
+        logger.info("视觉分析完成 (无返回数据)")
 
     return result
 
