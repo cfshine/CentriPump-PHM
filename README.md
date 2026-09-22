@@ -40,15 +40,16 @@ CentriPump-PHM/
 │
 ├── docs/                           # 项目文档与架构图
 │   ├── diagnosis_graph.png         # 诊断工作流拓扑图
-│   └── logging.md                  # 日志、Trace 与调用链记录设计说明
+│   ├── logging.md                  # 日志、Trace 与调用链记录设计说明
+│   └── safety_guard.md             # Step 6: 确定性安全门禁与分流机制设计规范
 │
 ├── logs/                           # 运行时日志目录
 │   └── app.log                     # 应用运行日志与全链路调用记录
 │
 ├── rules/                          # Step 6: 确定性安全门禁库（核心安全边界，不调用大模型）
-│   ├── ram_matrix.json             # RAM 风险矩阵配置（风险等级、高危设备黑名单映射）
-│   ├── safety_guard.py             # 确定性安全门禁判定引擎（置信度卡点、拦截分流、人工升级）
-│   ├── thresholds.py               # 规则阈值与安全边界常量
+│   ├── ram_matrix.json             # RAM 风险矩阵配置（风险等级映射、高危设备黑名单）
+│   ├── safety_guard.py             # 确定性安全门禁判定引擎（置信度卡点、拦截分流、动作防护覆盖）
+│   ├── thresholds.py               # 规则阈值与安全边界常量（唯一数值出处，GB 50275/企业标准）
 │   └── __init__.py
 │
 ├── scripts/                        # 辅助脚本与测试数据生成工具
@@ -63,12 +64,12 @@ CentriPump-PHM/
 │   │   └── __init__.py
 │   │
 │   ├── core/                       # 核心基础能力
-│   │   ├── logger.py               # 核心日志能力与运行上下文管理
+│   │   ├── logger.py               # 核心日志能力、Span 生命周期与运行上下文管理
 │   │   └── __init__.py
 │   │
 │   ├── orchestrator/               # 工作流编排层
-│   │   ├── graph.py                # LangGraph 状态图定义（节点拓扑、边关系、App 编译）
-│   │   ├── nodes.py                # 工作流节点适配函数（State 解包、子 Agent 调用、结果回写）
+│   │   ├── graph.py                # LangGraph 状态图定义（节点拓扑、边关系、App 编译、SqliteSaver）
+│   │   ├── nodes.py                # 工作流节点适配函数（三要素前置检查、多源证据汇聚、门禁分流与交付）
 │   │   ├── runner.py               # 工作流运行入口（创建运行上下文、配置 thread_id/trace_id、执行 Graph）
 │   │   └── __init__.py
 │   │
@@ -79,7 +80,7 @@ CentriPump-PHM/
 │   │
 │   ├── sub_agents/                 # 专项子 Agent 业务实现（独立可测）
 │   │   ├── __init__.py
-│   │
+│   │   │
 │   │   ├── data_agent/             # Step 2: 时序数据分析专家
 │   │   │   ├── analyzer.py         # 时序统计、趋势分析、突变检测与频率特征分析
 │   │   │   ├── data_agent_README.md # 数据 Agent 的局部设计与使用说明
@@ -89,12 +90,12 @@ CentriPump-PHM/
 │   │   │   ├── repository.py        # 数据仓储与外部/本地数据源访问层
 │   │   │   ├── timeseries_tools.py # 数据清洗、窗口处理、FFT 等时序分析工具
 │   │   │   └── __init__.py
-│   │
+│   │   │
 │   │   ├── manual_agent/           # Step 4: 手册知识与故障机理提炼专家（RAG）
 │   │   │   ├── extractor.py        # 手册条款提炼、故障机理抽取与处置要求匹配
 │   │   │   ├── retriever.py        # 混合检索（Dense 向量 + BM25 稀疏检索）
 │   │   │   └── __init__.py
-│   │
+│   │   │
 │   │   └── vision_agent/           # Step 3: 视觉特征抽取专家
 │   │       ├── image_io.py         # 图像读取、路径处理与输入输出管理
 │   │       ├── ocr_quality.py      # OCR 结果质量评估与有效性判断
@@ -107,14 +108,14 @@ CentriPump-PHM/
 │   │       └── vision_pipeline.py  # 图像预处理、OCR、视觉模型分析的完整流水线
 │   │
 │   └── utils/                      # 通用底座基础设施
-│       ├── config_loader.py        # 配置加载工具（解析 YAML、读取环境变量）
+│       ├── config_loader.py        # 配置加载工具（解析 YAML、读取环境变量、支持 extra='ignore'）
 │       ├── database.py             # 数据库连接、会话与持久化访问封装
 │       ├── llm_client.py           # LLM 统一客户端（重试、Token 统计、结构化输出等）
-│       ├── logger.py               # 通用日志工具与结构化日志记录
 │       └── __init__.py
 │
 ├── tests/                          # 自动化测试用例
-│   └── test_logging_context.py     # 日志上下文、trace_id 等调用链测试
+│   ├── test_logging_context.py     # 日志上下文、trace_id 等调用链测试
+│   └── test_safety_guard.py        # Step 6 确定性安全门禁单测与端到端分流测试
 │
 ├── .env.example                    # 环境变量配置模板（真实 .env 不入库）
 ├── .gitignore                      # Git 忽略规则
