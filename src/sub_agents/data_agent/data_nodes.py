@@ -19,9 +19,12 @@ from src.schemas.state import (
     AlarmState,
     DataDescription,
     DataQuality,
+    DataSegment,
     DataState,
     DiagnosisState,
+    Measurement,
     TelemetryRef,
+    node_output,
 )
 from src.sub_agents.data_agent.analyzer import _judge_flags, _segment_metrics
 from src.sub_agents.data_agent.data_tools import _parse_ts, query_scada_telemetry
@@ -61,7 +64,7 @@ def _data_update(state: DiagnosisState, **updates) -> dict:
 
     参数：
         state:   当前全局状态（读它现有的 data 盒子）。
-        updates: 本次要覆盖的 ``DataState`` 字段，如 ``quality=...`` / ``metrics=...``。
+        updates: 本次要覆盖的 ``DataState`` 字段，如 ``quality=...`` / ``measurements=...``。
 
     返回：
         ``{"data": DataState}``。
@@ -72,19 +75,15 @@ def _data_update(state: DiagnosisState, **updates) -> dict:
 # ==================== 大模型输出契约（Pydantic 严格的数据校验）====================
 
 class DescriptionOut(BaseModel):
-    """单条数据现象描述（LLM 输出用，字段与组长的 ``DataDescription`` 对齐）。
+    """单条数据现象描述（LLM 输出用，字段与 ``DataDescription`` 对齐）。
 
     参数（由大模型填）：
-        type:        现象类别，六选一（见下列 Literal）
+        kind:        现象类别，六选一（见下列 Literal）
         description: 该现象的自然语言描述；只能描述观测到的现象，禁止故障归因
         evidence:    支撑该描述的指标名或规则码，如 ``['max_temp_de', 'slope_temp_de']``
-
-    说明：
-        这里是"大模型返回值"的契约；节点会把它映射成 ``DataDescription``，
-        并按白名单过滤 evidence（编造的指标名会被丢掉）。
     """
 
-    type: Literal["TREND", "ANOMALY", "THRESHOLD", "CORRELATION", "ALARM", "OTHER"] = Field(
+    kind: Literal["TREND", "ANOMALY", "THRESHOLD", "CORRELATION", "ALARM", "OTHER"] = Field(
         description="该现象的类别。"
     )
     description: str = Field(
@@ -108,12 +107,169 @@ class SemanticizeOutput(BaseModel):
     )
 
 
+_MEASUREMENT_UNITS: dict[str, str] = {
+    "duration_sec": "s",
+    "data_points": "count",
+    "avg_flow": "m³/h",
+    "avg_press_out": "MPa",
+    "avg_press_in": "MPa",
+    "cv_flow": "%",
+    "cv_press": "%",
+    "slope_temp_de": "℃/min",
+    "max_temp_de": "℃",
+    "max_temp_nde": "℃",
+    "slope_vib_de": "mm/s/min",
+    "max_vib_de": "mm/s",
+    "max_vib_nde": "mm/s",
+    "avg_motor_current": "A",
+    "max_motor_current": "A",
+    "cv_flow_peak": "%",
+    "cv_press_peak": "%",
+}
+
+_OVERALL_MEASUREMENT_UNITS: dict[str, str] = {
+    "total_points": "count",
+    "phase_count": "count",
+    "max_temp_de": "℃",
+    "max_vib_de": "mm/s",
+    "max_temp_nde": "℃",
+    "max_vib_nde": "mm/s",
+    "avg_flow": "m³/h",
+    "min_press_in": "MPa",
+}
+
+
+def _build_phase_records(
+    phases: list[dict],
+) -> tuple[list[Measurement], list[DataSegment]]:
+    """把内部分段字典转换成带单位、带时间窗口的 State 结构。"""
+
+    measurements: list[Measurement] = []
+    segments: list[DataSegment] = []
+
+    for index, phase in enumerate(phases):
+        segment_key = f"phase:{index}"
+        start = str(phase.get("start", ""))
+        end = str(phase.get("end", ""))
+        segments.append(
+            DataSegment(
+                index=index,
+                state=str(phase.get("state", "")),
+                start_time=start,
+                end_time=end,
+                duration_sec=int(phase.get("duration_sec") or 0),
+                data_points=int(phase.get("data_points") or 0),
+                rule_hits=list(phase.get("rule_hits") or []),
+                ramp_start_time=phase.get("ramp_start_time"),
+            )
+        )
+
+        for name, unit in _MEASUREMENT_UNITS.items():
+            value = phase.get(name)
+            if value is None:
+                continue
+            measurements.append(
+                Measurement(
+                    name=name,
+                    value=float(value),
+                    unit=unit,
+                    segment=segment_key,
+                    start_time=start,
+                    end_time=end,
+                )
+            )
+
+    return measurements, segments
+
+
+def _build_overall_measurements(
+    df: pd.DataFrame,
+    phases: list[dict],
+    window_start: str,
+    window_end: str,
+) -> list[Measurement]:
+    """生成窗口级指标（安全门禁与提示词共同消费）。"""
+
+    values = {
+        "total_points": len(df),
+        "phase_count": len(phases),
+        "max_temp_de": df["temp_de"].max(),
+        "max_vib_de": df["vib_rms_de"].max(),
+        "max_temp_nde": df["temp_nde"].max(),
+        "max_vib_nde": df["vib_rms_nde"].max(),
+        "avg_flow": df["flow_rate"].mean(),
+        "min_press_in": df["press_in"].min(),
+    }
+
+    measurements: list[Measurement] = []
+    for name, unit in _OVERALL_MEASUREMENT_UNITS.items():
+        value = _py(values.get(name))
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        measurements.append(
+            Measurement(
+                name=name,
+                value=float(value),
+                unit=unit,
+                segment="overall",
+                start_time=window_start,
+                end_time=window_end,
+            )
+        )
+    return measurements
+
+
+def _phase_views(data: DataState) -> list[dict]:
+    """从结构化状态重建分段视图，供既有提示词格式化函数使用。"""
+
+    by_segment: dict[str, dict[str, float]] = {}
+    for measurement in data.measurements:
+        by_segment.setdefault(measurement.segment, {})[measurement.name] = measurement.value
+
+    views: list[dict] = []
+    for segment in data.segments:
+        view: dict = {
+            "state": segment.state,
+            "start": segment.start_time,
+            "end": segment.end_time,
+            "duration_sec": segment.duration_sec,
+            "data_points": segment.data_points,
+            "rule_hits": list(segment.rule_hits),
+        }
+        if segment.ramp_start_time:
+            view["ramp_start_time"] = segment.ramp_start_time
+        view.update(by_segment.get(f"phase:{segment.index}", {}))
+        views.append(view)
+    return views
+
+
+def _overall_view(data: DataState, ctx) -> dict:
+    """从结构化状态重建窗口概要视图，供提示词格式化函数使用。"""
+
+    overall: dict = {
+        "total_points": data.quality.total_points,
+        "window_start": data.telemetry_ref.start_time or ctx.start_time,
+        "window_end": data.telemetry_ref.end_time or ctx.end_time,
+        "phase_count": len(data.segments),
+        "effective_alarm_codes": ";".join(data.alarms.effective),
+    }
+    if data.segments:
+        overall["start_state"] = data.segments[0].state
+        overall["end_state"] = data.segments[-1].state
+        overall["has_shutdown"] = any(seg.state == "TRIP_SHUTDOWN" for seg in data.segments)
+
+    for measurement in data.measurements:
+        if measurement.segment == "overall":
+            overall[measurement.name] = measurement.value
+    return overall
+
+
 def _evidence_whitelist(overall: dict, phases: list[dict], rule_codes: list[str]) -> set[str]:
     """材料里真正出现过的指标名与规则码 —— 用来过滤大模型编造的 evidence。
 
     参数：
-        overall:    ``data.metrics["overall"]``（窗口概要与它的键名）
-        phases:     ``data.metrics["phases"]``（每段的指标键名）
+        overall:    窗口级指标视图（每个指标名对应一个数值）
+        phases:     分段指标视图（每段的指标名与数值）
         rule_codes: ``data.threshold_flags``（规则码本身也可作为证据）
 
     返回：
@@ -128,6 +284,7 @@ def _evidence_whitelist(overall: dict, phases: list[dict], rule_codes: list[str]
 
 # ==================== 节点 1: 取数 + 确定性计算 ====================
 
+@node_output("analyze")
 def analyze_node(state: DiagnosisState) -> dict:
     """节点1：取时间窗口内的原始遥测，并做确定性计算（纯 pandas，无大模型）。
 
@@ -136,7 +293,7 @@ def analyze_node(state: DiagnosisState) -> dict:
 
     返回：
         ``{"data": DataState}``，三种出口：
-          正常         → quality=OK，metrics / threshold_flags / alarms / telemetry_ref 全部填好
+          正常         → quality=OK，measurements / segments / threshold_flags / alarms 全部填好
           没有时间窗口 → quality=EMPTY + reason（**不查库**）
           窗口内无数据 → quality=EMPTY + reason
     """
@@ -156,7 +313,7 @@ def analyze_node(state: DiagnosisState) -> dict:
             telemetry_ref=telemetry_ref,
             quality=DataQuality(status="EMPTY", total_points=0,
                                 reason="未提供时间窗口：本次未做时序分析"),
-            metrics={}, threshold_flags=[], alarms=AlarmState(),
+            threshold_flags=[], alarms=AlarmState(),
         )
 
     print(f"[analyze] 拉取 {ctx.device_id} 在 {ctx.start_time} ~ {ctx.end_time} 的数据")
@@ -170,7 +327,7 @@ def analyze_node(state: DiagnosisState) -> dict:
             telemetry_ref=telemetry_ref,
             quality=DataQuality(status="EMPTY", total_points=0,
                                 reason="指定时间窗口内无 SCADA 记录"),
-            metrics={}, threshold_flags=[], alarms=AlarmState(),
+            threshold_flags=[], alarms=AlarmState(),
         )
 
     print("[analyze] 开始确定性计算（分段统计 + 规则判定）")
@@ -192,20 +349,13 @@ def analyze_node(state: DiagnosisState) -> dict:
     # —— 3. 分段规则判定：命中的**机器码**写回各段 rule_hits，并返回窗口级去重码
     rule_codes = _judge_flags(phases)
 
-    # —— 4. 全局概要（报警码不在这里，改由 data.alarms 单一出处）
-    overall = {
-        "total_points": int(len(df)),
-        "window_start": df['timestamp'].iloc[0].isoformat(),
-        "window_end": df['timestamp'].iloc[-1].isoformat(),
-        "start_state": df['operating_state'].iloc[0],
-        "end_state": df['operating_state'].iloc[-1],
-        "has_shutdown": bool((df['operating_state'] == 'TRIP_SHUTDOWN').any()),
-        "phase_count": len(phases),
-        "max_temp_de_overall": _py(df['temp_de'].max(), 1),
-        "max_vib_de_overall": _py(df['vib_rms_de'].max(), 2),
-        "max_temp_nde_overall": _py(df['temp_nde'].max(), 1),
-        "max_vib_nde_overall": _py(df['vib_rms_nde'].max(), 2),
-    }
+    # —— 4. 结构化指标：窗口级 + 分段级，全部带单位与时间窗口 ——
+    window_start = df['timestamp'].iloc[0].isoformat()
+    window_end = df['timestamp'].iloc[-1].isoformat()
+    phase_measurements, segments = _build_phase_records(phases)
+    measurements = phase_measurements + _build_overall_measurements(
+        df, phases, window_start, window_end
+    )
 
     # —— 5. 数据完整性：窗口里本该有多少点 vs 实际拿到多少点 ——
     window_sec = (_parse_ts(ctx.end_time) - _parse_ts(ctx.start_time)).total_seconds()
@@ -228,7 +378,8 @@ def analyze_node(state: DiagnosisState) -> dict:
         state,
         telemetry_ref=telemetry_ref,
         quality=quality,
-        metrics={"overall": overall, "phases": phases},
+        measurements=measurements,
+        segments=segments,
         threshold_flags=rule_codes,
         alarms=AlarmState(effective=effective, last=last, all=all_codes),
     )
@@ -236,6 +387,7 @@ def analyze_node(state: DiagnosisState) -> dict:
 
 # ==================== 节点 2: LLM 语义化 ====================
 
+@node_output("summarize")
 def summarize_node(state: DiagnosisState) -> dict:
     """节点2：把 Python 算好的数字交给大模型，产出数据现象描述（写进 ``data.descriptions``）。
 
@@ -243,7 +395,7 @@ def summarize_node(state: DiagnosisState) -> dict:
         state: 全局状态；读 ``state.context``（提示词用）与 ``state.data``（材料）。
 
     返回：
-        正常          → ``{"data": DataState}``，``descriptions`` 里装 1~6 条按 type 分类的现象描述
+        正常          → ``{"data": DataState}``，``descriptions`` 里装 1~6 条按 kind 分类的现象描述
         没窗口 / 没数据 → ``{}``（什么都不写，也**不调大模型**）
     """
     ctx = state.context
@@ -256,8 +408,8 @@ def summarize_node(state: DiagnosisState) -> dict:
         print(f"[summarize] 数据质量 {data.quality.status} → 跳过语义化（不调用大模型）")
         return {}
 
-    phases = data.metrics.get("phases", [])
-    overall = data.metrics.get("overall", {})
+    phases = _phase_views(data)
+    overall = _overall_view(data, ctx)
 
     # 阈值命中材料：把机器码渲染成中文事实句给大模型看（渲染只发生在这里，不进 state）
     rule_hits_text = render_rule_hits(phases)
@@ -283,7 +435,7 @@ def summarize_node(state: DiagnosisState) -> dict:
     allowed_evidence = _evidence_whitelist(overall, phases, data.threshold_flags)
     descriptions = [
         DataDescription(
-            type=d.type,
+            kind=d.kind,
             description=d.description,
             evidence=[e for e in d.evidence if e in allowed_evidence],
         )
@@ -294,8 +446,7 @@ def summarize_node(state: DiagnosisState) -> dict:
 
     # 预警线：按**事件数**算（口径见 README；这条只是日志提醒，不影响断言）
     state_switches = max(0, len(phases) - 1)
-    codes = data.alarms.effective
-    alarm_code_count = 0 if codes in ("", "NONE") else len([c for c in codes.split(";") if c.strip()])
+    alarm_code_count = len(data.alarms.effective)
     warn_threshold = min(1000, 500 + 40 * state_switches + 20 * alarm_code_count)
     total_len = sum(len(d.description) for d in descriptions)
     if total_len > warn_threshold:

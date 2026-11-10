@@ -118,7 +118,7 @@ def _resolve_state(computed_alarm: str, phase_intent: str,
     
     迟滞规则：
       1. 报警码从"有"变"无"时，至少保持一拍，避免阈值抖动
-      2. 【新增】DEGRADING 中途不允许回 NORMAL：
+      2. DEGRADING 中途不允许回 NORMAL：
          若上一状态是 DEGRADING 且温度仍接近预警线（≥65℃），
          保持 DEGRADING，避免在温度单调上升时出现 NORMAL 回弹
     """
@@ -142,7 +142,7 @@ def _resolve_state(computed_alarm: str, phase_intent: str,
     if phase_intent == "DEGRADING":
         return "DEGRADING"
     
-    # 规则 5b：【新增】劣化中途不允许回 NORMAL
+    # 规则 5b：劣化中途不允许回 NORMAL
     # 场景：上一状态是 DEGRADING，当前温度仍在 65~70℃（尚未触发 TAH-101），
     #       但物理上温度仍在上升，不应回 NORMAL
     if (prev_state == "DEGRADING" 
@@ -841,7 +841,7 @@ def _summarize(rows: List[dict]) -> None:
     else:
         print("报警码：无")
 
-    # 【新增】一致性检查：状态 vs 报警码
+    # 一致性检查：状态 vs 报警码
     print(f"\n{'=' * 70}")
     print("一致性检查（状态与报警码是否矛盾）：")
     print(f"{'=' * 70}")

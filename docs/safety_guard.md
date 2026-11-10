@@ -159,7 +159,9 @@ CentriPump-PHM/
 │   ├── orchestrator/
 │   │   └── nodes.py        # safety_guard_node 适配函数（解包 State → 调用引擎 → 回写 State）
 │   └── schemas/
-│       └── state.py        # SafetyState / HumanState 契约定义
+│       └── state/
+│           ├── safety.py    # SafetyState / SafetyVerdict（不可变裁决）
+│           └── human.py     # 追加式人工审核记录
 ```
 
 ### 4.2 引擎类设计（`rules/safety_guard.py`）
@@ -173,50 +175,22 @@ class SafetyGuardEngine:
 
     def evaluate(self, state: DiagnosisState) -> SafetyState:
         """主入口：对当前全局状态执行安全门禁全量规则评判。"""
-        # 1. 停机线与急剧恶化检查（功能 1）
-        trip_hit, trip_reasons, trip_rules = self._check_critical_trips(state)
-        if trip_hit:
-            return SafetyState(
-                risk_level="CRITICAL",
-                decision="BLOCK",
-                rule_hits=trip_rules,
-                reasons=trip_reasons,
-            )
-
-        # 2. 数据有效性检查（功能 2）
-        data_hit, data_reasons, data_rules = self._check_data_sufficiency(state)
-        if data_hit:
-            return SafetyState(
-                risk_level="HIGH" if state.context.device_id else "LOW",
-                decision="INSUFFICIENT_DATA",
-                rule_hits=data_rules,
-                reasons=data_reasons,
-            )
-
-        # 3. 高危设备管控（功能 3）
-        is_high_risk = self._is_high_risk_device(state.context.device_id)
-
-        # 4. 多源证据冲突判定（功能 4）
-        has_conflicts, conflict_reasons = self._check_evidence_conflicts(state)
-
-        # 5. RAM 风险矩阵综合评级（功能 5）
-        risk_level = self._evaluate_ram_level(state, is_high_risk)
-
-        # 6. 确定最终 decision 分流
-        decision = self._derive_decision(
-            risk_level=risk_level,
-            is_high_risk=is_high_risk,
-            has_conflicts=has_conflicts,
-            confidence=state.reasoning.confidence,
-        )
-
-        return SafetyState(
-            risk_level=risk_level,
+        # 1~5. 停机线、数据充分性、黑名单、证据冲突、故障模式确认与 RAM 评级
+        ...
+        verdict = SafetyVerdict(
             decision=decision,
-            rule_hits=[...],
-            reasons=[...],
+            risk_level=risk_level,
+            failure_mode=confirmed_failure_mode,
+            rule_hits=sorted(rule_hits),
+            reasons=reasons,
+            rule_version=self.rule_version,
+            input_hash=self._compute_input_hash(state),
         )
+        return SafetyState(verdict=verdict)
 ```
+
+> `SafetyVerdict` 为 `frozen=True` 的不可变对象，且携带规则版本与输入哈希：
+> 同一份输入配合同一规则版本，必须重放出完全相同的裁决。
 
 ---
 

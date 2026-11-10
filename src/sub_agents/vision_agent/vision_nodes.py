@@ -14,7 +14,13 @@
 """
 
 from __future__ import annotations
-from src.schemas.state import DiagnosisState, VisionFinding, VisionState
+from src.schemas.state import (
+    DiagnosisState,
+    VisionFinding,
+    VisionState,
+    confidence_from_score,
+    node_output,
+)
 from src.sub_agents.vision_agent.vision_compose import (
     FAILED_PREFIX,
     compose_summary,
@@ -59,6 +65,7 @@ def _derive_status(images: list[VisionImage], findings: list[VisionFinding]) -> 
     return "DEFECT_FOUND" if findings else "NO_DEFECT"
 
 
+@node_output("vision")
 def vision_node(state: DiagnosisState) -> dict:
     """**Step 3 的唯一节点**：逐张处理图片，把结果写进 ``state.vision``。
 
@@ -120,7 +127,7 @@ def vision_node(state: DiagnosisState) -> dict:
                     defect_type=obs.defect_type.strip(),
                     severity=obs.severity,
                     location=obs.target,
-                    confidence=obs.confidence,
+                    confidence=confidence_from_score(obs.confidence),
                     evidence=obs.evidence.strip(),
                 )
             )

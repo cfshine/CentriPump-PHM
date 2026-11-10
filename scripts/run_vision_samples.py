@@ -152,8 +152,8 @@ def _state_for(ref, args):
     返回：
         ``DiagnosisState`` —— 图片以 ``ImageRef`` 形式放进 ``context.image_refs``。
 
-    ★ 2026-09-20：节点的输入已从顶层 ``image_refs: list[str]`` 改成
-      ``context.image_refs: list[ImageRef]``，所以脚本也必须走组长的构造函数。
+    ★ 节点输入以 ``context.image_refs: list[ImageRef]`` 为准，
+      因此脚本也通过统一的初始状态构造函数准备输入。
     """
     from src.schemas.state import ImageRef, create_initial_state
 
@@ -198,7 +198,7 @@ def _print_findings(vision) -> None:
     print(f"  status={vision.status}  缺陷 {len(vision.findings)} 条")
     for i, f in enumerate(vision.findings, 1):
         print(f"    [{i}] {f.image_id} {f.defect_type} {f.severity} "
-              f"conf={f.confidence} — {f.location}")
+              f"conf={f.confidence.value} — {f.location}")
         print(f"        依据: {f.evidence}")
 
 

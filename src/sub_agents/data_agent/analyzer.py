@@ -57,9 +57,7 @@ def _segment_metrics(seg: pd.DataFrame) -> dict:
         "cv_flow": _py(_cv(seg['flow_rate']), 2),
         "cv_press": _py(_cv(seg['press_out']), 2),
 
-        # 温度
-        # ★ 只给驱动端算斜率：非驱动端斜率（原 slope_temp_nde）全项目没有任何地方读，
-        #   2026-09-17 删除。非驱动端仍保留峰值 max_temp_nde（叙事要用）。
+        # 温度：只给驱动端算斜率，非驱动端保留峰值用于叙事。
         "slope_temp_de": _py(_safe_slope(seg_minutes, seg['temp_de']), 3),
         "max_temp_de": _py(seg['temp_de'].max(), 1),
         "max_temp_nde": _py(seg['temp_nde'].max(), 1),
@@ -111,7 +109,7 @@ def _judge_flags(phases: list[dict]) -> list[str]:
             ph["rule_hits"] = []
             continue
 
-        hits: list[str] = []          # 本段命中的规则码（原先是中文句子）
+        hits: list[str] = []          # 本段命中的规则码
 
         # ========== 温度判据 ==========
         st = ph["slope_temp_de"]

@@ -29,10 +29,10 @@
                                      │ 只回写 data 一个盒子
                                      ▼
                           state.data（DataState）
-   ┌───────────────┬──────────────┬──────────────┬──────────────┬────────────┐
-   ▼               ▼              ▼              ▼              ▼            ▼
-telemetry_ref   quality        metrics     threshold_flags   alarms   descriptions
-（取数溯源）  （数据质量）  （overall+phases）（规则码）    （报警码）  （现象描述）
+   ┌───────────────┬──────────────┬──────────────┬──────────────┬────────────┬────────────┐
+   ▼               ▼              ▼              ▼              ▼            ▼            ▼
+telemetry_ref   quality     measurements     segments      threshold_flags   alarms   descriptions
+（取数溯源）  （数据质量） （带单位指标） （分段边界+规则） （规则码）    （报警码）  （现象描述）
 ```
 
 ### 文件清单
@@ -71,7 +71,7 @@ $PY -m pytest tests/ -q                       # 全量 → 期望 57 passed
 | 全部用例 `points=0` | MySQL 没起 / 窗口无数据 | 查 `scada_db.scada_telemetry` 有没有数据 |
 | `AttributeError: 'DiagnosisState' object has no attribute 'get'` | 用了旧的扁平字段访问 | 必须写 `state.context.xxx` / `state.data.xxx` |
 | 图构建类用例 skip | 没配 `DEEPSEEK_API_KEY` | 按上面 eval 一行 |
-| `ValidationError: Extra inputs are not permitted` | 往 state 里塞了未声明的键 | 对照 `src/schemas/state.py` |
+| `ValidationError: Extra inputs are not permitted` | 往 state 里塞了未声明的键 | 对照 `src/schemas/state/` |
 
 ---
 
@@ -157,12 +157,12 @@ data.alarms = AlarmState(effective="TAH-101;TAHH-101;VAH-102;VAHH-102",
 > **下游 Step 6（安全门禁）靠它区分"看过了没毛病"和"压根没看成"。**
 > 阈值 `SAMPLE_INTERVAL_SEC` / `DATA_COVERAGE_MIN_PCT` 也在 `rules/thresholds.py`。
 
-### 阶段 6｜大模型输出（1~6 条按 type 分类）
+### 阶段 6｜大模型输出（1~6 条按 kind 分类）
 
 ```jsonc
 data.descriptions = [
-  {"type": "TREND",       "description": "驱动端温度全程单调爬升…", "evidence": ["slope_temp_de", "max_temp_de"]},
-  {"type": "THRESHOLD",   "description": "驱动端温度越过停机线…",   "evidence": ["max_temp_de", "BEARING_TEMP_DE_TRIP"]},
+  {"kind": "TREND",       "description": "驱动端温度全程单调爬升…", "evidence": ["slope_temp_de", "max_temp_de"]},
+  {"kind": "THRESHOLD",   "description": "驱动端温度越过停机线…",   "evidence": ["max_temp_de", "BEARING_TEMP_DE_TRIP"]},
   {"type": "CORRELATION", "description": "温度与振动同步加速上升…", "evidence": ["slope_temp_de", "slope_vib_de"]},
   {"type": "OTHER",       "description": "流量与出口压力全程平稳…", "evidence": ["avg_flow", "cv_flow_peak"]}
 ]
@@ -196,11 +196,10 @@ return {"data": DataState.model_validate({**state.data.model_dump(), **updates})
 两个原因，都实测过：
 
 1. **LangGraph 用返回值替换整个盒子** —— 只返回部分字段（如只给 `descriptions`），
-   `analyze` 刚写好的 `metrics` / `quality` 会被一起冲掉。所以要先摊平现有内容再覆盖。
-2. **`model_copy(update=...)` 不跑校验器** —— 即使开了 `validate_assignment` 也一样，
-   会绕过组长 `StateModel` 里的 checkpoint 类型检查（只允许精确的
-   `str/int/float/bool/None/list/dict`）。用 `model_validate` 重新构造，校验当场发生
-   （有测试钉住：塞 `numpy.float64` 会被拦下）。
+   `analyze` 刚写好的 `measurements` / `segments` / `quality` 会被一起冲掉。所以要先摊平现有内容再覆盖。
+2. **`model_copy(update=...)` 不跑校验器** —— 即使开了 `validate_assignment` 也一样。
+   用 `model_validate` 重新构造，字段类型校验当场发生；节点返回边界还会用
+   checkpoint serde 做一次真实序列化往返校验。
 
 ### 3.3 为什么"降级"用 `quality` 而不是中文告警？
 

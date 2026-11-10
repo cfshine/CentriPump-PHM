@@ -75,7 +75,21 @@ CentriPump-PHM/
 │   │
 │   ├── schemas/                    # Pydantic 强类型数据契约
 │   │   ├── report.py               # 最终诊断报告、排查工单与溯源证据结构
-│   │   ├── state.py                # LangGraph 全局 DiagnosisState 及各阶段状态模型
+│   │   ├── state/                  # LangGraph 状态契约包（按 Agent 拆分）
+│   │   │   ├── common.py           # 共享枚举、EvidenceRef、Measurement、StepStatus
+│   │   │   ├── context.py          # 诊断上下文与图片引用
+│   │   │   ├── engineer_text.py    # 工程师文本状态
+│   │   │   ├── data.py             # Step 2 时序分析状态
+│   │   │   ├── vision.py           # Step 3 视觉分析状态
+│   │   │   ├── manual.py           # Step 4 手册 / RAG 状态
+│   │   │   ├── reasoning.py        # Step 5 LLM 故障模式提议
+│   │   │   ├── safety.py           # Step 6 不可变安全裁决
+│   │   │   ├── human.py            # 追加式人工审核记录
+│   │   │   ├── delivery.py         # Step 7 工单交付状态
+│   │   │   ├── workflow.py         # 流程元数据
+│   │   │   ├── diagnosis.py        # 全局 DiagnosisState 与 create_initial_state
+│   │   │   ├── validation.py       # 节点输出白名单与 checkpoint serde 校验
+│   │   │   └── __init__.py         # 统一导出
 │   │   └── __init__.py
 │   │
 │   ├── sub_agents/                 # 专项子 Agent 业务实现（独立可测）

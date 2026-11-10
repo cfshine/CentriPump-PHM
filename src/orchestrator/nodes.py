@@ -14,13 +14,26 @@ CentriPump-PHM 的 LangGraph 节点。
 from datetime import datetime, timedelta
 
 from src.schemas.state import (
-    AlarmState,
+    Confidence,
     DataQuality,
     DataState,
+    DeliveryState,
     DiagnosisState,
     EngineerTextState,
+    EvidenceKind,
+    EvidenceRef,
+    EvidenceSource,
+    FailureMode,
+    FailureModeProposal,
+    Hypothesis,
+    ManualEvidence,
+    ManualState,
+    ProcedureRequirement,
+    ReasoningState,
+    RecommendedAction,
     TelemetryRef,
     VisionState,
+    node_output,
 )
 from src.core.logger import get_logger
 
@@ -33,11 +46,9 @@ logger = get_logger(__name__)
 # =============================================================================
 
 
+@node_output("start_node")
 def start_node(state: DiagnosisState) -> dict:
-    """
-    Step 1：流程启动节点。
-    完成基础环境检查与初始化，若未提供时间窗口，默认补充为当前时间往前半小时。
-    """
+    """Step 1：流程启动节点。"""
     logger.info("诊断流程开始")
     ctx = state.context
     updates = {}
@@ -62,6 +73,7 @@ def start_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+@node_output("engineer_text")
 def engineer_text_node(state: DiagnosisState) -> dict:
     """
     Step 2：工程师文本处理。
@@ -108,6 +120,7 @@ def engineer_text_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+@node_output("data")
 def data_node(state: DiagnosisState) -> dict:
     """
     Step 3：时序数据分析。
@@ -120,11 +133,13 @@ def data_node(state: DiagnosisState) -> dict:
     ctx = state.context
     device_id = (ctx.device_id or "").strip()
 
-    # 若已有分析结果（非 PENDING/EMPTY），直接复用，避免重复分析或覆盖外部输入
-    if getattr(state.data.quality, "status", None) in ("OK", "PARTIAL") and (
-        state.data.threshold_flags or state.data.metrics or state.data.descriptions
-    ):
-        logger.info("已有时序数据分析结果，直接复用: 质量=%s, 触发规则数=%d", state.data.quality.status, len(state.data.threshold_flags))
+    # 若已有分析结果（非 PENDING），直接复用，避免重复分析或覆盖外部输入
+    if getattr(state.data.quality, "status", None) != "PENDING":
+        logger.info(
+            "已有时序数据分析结果，直接复用: 质量=%s, 触发规则数=%d",
+            state.data.quality.status,
+            len(state.data.threshold_flags),
+        )
         return {"data": state.data}
 
     # 解析时间窗口（若缺失则兜底为当前时间往前半小时）
@@ -155,10 +170,6 @@ def data_node(state: DiagnosisState) -> dict:
             "data": DataState(
                 telemetry_ref=telemetry_ref,
                 quality=quality,
-                metrics={},
-                threshold_flags=[],
-                alarms=AlarmState(effective="NONE", last="NONE", all=[]),
-                descriptions=[],
             )
         }
 
@@ -194,10 +205,6 @@ def data_node(state: DiagnosisState) -> dict:
             "data": DataState(
                 telemetry_ref=telemetry_ref,
                 quality=quality,
-                metrics={},
-                threshold_flags=[],
-                alarms=AlarmState(effective="NONE", last="NONE", all=[]),
-                descriptions=[],
             )
         }
 
@@ -218,6 +225,7 @@ def data_node(state: DiagnosisState) -> dict:
     return result
 
 
+@node_output("vision")
 def vision_node(state: DiagnosisState) -> dict:
     """
     Step 3：现场图片故障特征分析。
@@ -226,9 +234,13 @@ def vision_node(state: DiagnosisState) -> dict:
     - 若不存在图片：记录为无图片 (NO_IMAGE)，并决定跳过后续视觉大模型分析；
     - 若存在图片：调用 Vision Agent 逐图执行预处理、OCR 辅助与视觉大模型分析，回写 vision 盒子。
     """
-    # 若已有视觉分析结果（非 PENDING/NO_IMAGE），直接复用
-    if getattr(state.vision, "status", None) in ("DEFECT_FOUND", "NO_DEFECT"):
-        logger.info("已有视觉分析结果，直接复用: 状态=%s, 缺陷数=%d", state.vision.status, len(state.vision.findings))
+    # 若已有视觉分析结果（非 PENDING），直接复用
+    if getattr(state.vision, "status", None) != "PENDING":
+        logger.info(
+            "已有视觉分析结果，直接复用: 状态=%s, 缺陷数=%d",
+            state.vision.status,
+            len(state.vision.findings),
+        )
         return {"vision": state.vision}
 
     image_refs = state.context.image_refs or []
@@ -272,6 +284,7 @@ def vision_node(state: DiagnosisState) -> dict:
     return result
 
 
+@node_output("evidence_merge")
 def evidence_merge_node(state: DiagnosisState) -> dict:
     """
     证据汇聚节点。
@@ -295,17 +308,22 @@ def evidence_merge_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+def _manual_ref(chunk_id: str, page: int, section: str) -> EvidenceRef:
+    """构造手册条款的统一证据引用。"""
+
+    return EvidenceRef(
+        kind=EvidenceKind.MANUAL,
+        id=f"IS100-80-160-IOM#{chunk_id}",
+        locator=f"page {page} · {section}",
+    )
+
+
+@node_output("manual")
 def manual_node(state: DiagnosisState) -> dict:
     """
     Step 4：手册 / RAG 知识检索节点（当前阶段由高拟真硬编码规程引擎支撑）。
     基于设备类型、时序告警码、阈值特征与视觉缺陷，检索对应的《离心泵使用维护说明书》(IOM)及国标条款。
     """
-    from src.schemas.state import (
-        ManualEvidence,
-        ManualState,
-        ProcedureRequirement,
-        RecommendedAction,
-    )
 
     logger.info("开始检索维修手册与工程规程 (硬编码RAG模块)")
     flags = set(state.data.threshold_flags or [])
@@ -351,14 +369,14 @@ def manual_node(state: DiagnosisState) -> dict:
         requirements.append(
             ProcedureRequirement(
                 requirement="轴承箱润滑油脂应每运行2000小时补充或更换一次，严禁不同牌号锂基脂混用；每次补充量以充满轴承室1/3~1/2为宜。",
-                source_ref="IS100-80-160-IOM#chunk_sec4_bearing",
+                source_ref=_manual_ref("chunk_sec4_bearing", 28, "4.2 轴承润滑与温升规范"),
             )
         )
         actions.append(
             RecommendedAction(
                 action="停机冷却后拆检驱动端轴承压盖，检查润滑脂成色（有无炭化、铁屑粉末），测量轴承径向及轴向游隙。",
                 priority="HIGH",
-                source_ref="IS100-80-160-IOM#chunk_sec4_bearing",
+                source_ref=_manual_ref("chunk_sec4_bearing", 28, "4.2 轴承润滑与温升规范"),
             )
         )
         mechanisms.append("轴承润滑膜破裂导致金属干磨擦，引起瞬态快速温升与高频冲击振动加剧。")
@@ -380,14 +398,14 @@ def manual_node(state: DiagnosisState) -> dict:
         requirements.append(
             ProcedureRequirement(
                 requirement="定期清洗入口过滤网，严禁通过关小入口管路阀门来调节泵输送流量。",
-                source_ref="IS100-80-160-IOM#chunk_sec3_cavitation",
+                source_ref=_manual_ref("chunk_sec3_cavitation", 19, "3.5 泵吸入工况与防气蚀规程"),
             )
         )
         actions.append(
             RecommendedAction(
                 action="排查入口前置过滤器压差，疏通吸入管道堵塞，检查吸入储罐液位以恢复吸入正压。",
                 priority="HIGH",
-                source_ref="IS100-80-160-IOM#chunk_sec3_cavitation",
+                source_ref=_manual_ref("chunk_sec3_cavitation", 19, "3.5 泵吸入工况与防气蚀规程"),
             )
         )
         mechanisms.append("入口吸入阻力过大导致介质局部气化，微小气泡进入高压区溃灭产生微射流剥蚀叶轮并伴生剧烈流体脉动。")
@@ -408,14 +426,14 @@ def manual_node(state: DiagnosisState) -> dict:
         requirements.append(
             ProcedureRequirement(
                 requirement="机械密封安装弹簧压缩量必须精准控制在设计基准±0.5mm，严禁敲击碳化硅/石墨摩擦端面。",
-                source_ref="IS100-80-160-IOM#chunk_sec5_seal",
+                source_ref=_manual_ref("chunk_sec5_seal", 35, "5.1 机械密封检修与泄漏判据"),
             )
         )
         actions.append(
             RecommendedAction(
                 action="切断物料进出口隔离阀，冲洗排放泵腔介质，更换集装式机械密封总成与密封垫片。",
                 priority="HIGH",
-                source_ref="IS100-80-160-IOM#chunk_sec5_seal",
+                source_ref=_manual_ref("chunk_sec5_seal", 35, "5.1 机械密封检修与泄漏判据"),
             )
         )
         mechanisms.append("机械密封动静环干磨擦拉伤或冲洗液中断，导致密封面贴合失效造成介质外泄。")
@@ -437,7 +455,7 @@ def manual_node(state: DiagnosisState) -> dict:
             RecommendedAction(
                 action="使用钳形电流表校验三相运行平衡度，核对泵腔内是否存在异物缠绕或机械摩擦阻力过大。",
                 priority="MEDIUM",
-                source_ref="IS100-80-160-IOM#chunk_sec6_motor",
+                source_ref=_manual_ref("chunk_sec6_motor", 42, "6.3 电气驱动与负载校核"),
             )
         )
         mechanisms.append("泵内机械摩擦过载或介质粘度超标造成电机过负荷电流越界。")
@@ -459,7 +477,7 @@ def manual_node(state: DiagnosisState) -> dict:
             RecommendedAction(
                 action="按规定频次落实就地巡检，复测三向振动与轴承表面温度，核实流量计读数。",
                 priority="LOW",
-                source_ref="IS100-80-160-IOM#chunk_sec2_general",
+                source_ref=_manual_ref("chunk_sec2_general", 12, "2.1 离心泵日常点检与巡检基准"),
             )
         )
         mechanisms.append("机泵处于标准运行工况范围，维持计划性预防点检。")
@@ -482,109 +500,172 @@ def manual_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+FAILURE_MODE_LABELS: dict[FailureMode, str] = {
+    FailureMode.NORMAL: "机组运行工况综合正常",
+    FailureMode.BEARING_DEGRADATION: "驱动端轴承干摩擦或疲劳劣化",
+    FailureMode.CAVITATION: "吸入管路阻力异常导致泵腔气蚀脱流",
+    FailureMode.SEAL_LEAK: "机械密封动静环摩擦副失效泄漏",
+    FailureMode.MOTOR_OVERLOAD: "电机过载或泵内机械卡阻",
+    FailureMode.HYDRAULIC_IMBALANCE: "水力工况失衡",
+    FailureMode.INSUFFICIENT_EVIDENCE: "缺乏足够现场数据支持明确归因",
+    FailureMode.UNKNOWN: "尚未形成故障模式提议",
+}
+
+
+def _threshold_ref(code: str) -> EvidenceRef:
+    """构造阈值规则码的统一证据引用。"""
+
+    return EvidenceRef(
+        kind=EvidenceKind.THRESHOLD,
+        id=code,
+        locator="rules/thresholds.py",
+    )
+
+
+def _vision_ref(finding, fallback_index: int = 0) -> EvidenceRef:
+    """构造视觉发现的统一证据引用。"""
+
+    return EvidenceRef(
+        kind=EvidenceKind.VISION,
+        id=finding.image_id or f"vision_finding_{fallback_index}",
+        locator=finding.location or "pump_body",
+    )
+
+
+@node_output("reasoner")
 def reasoner_node(state: DiagnosisState) -> dict:
-    """
-    Step 5：综合证据并推理归因（支持上游预设结果或基于多源证据的启发式归因集成）。
-    """
-    from src.schemas.state import Hypothesis, ReasoningState
+    """Step 5：综合多源证据，产出受控词表内的故障模式提议。"""
 
     logger.info("开始综合证据并推理归因")
 
-    # 若调用方或上游已有归因结论且不为初始默认值，优先保留
-    if getattr(state.reasoning, "confidence", None) in ("LOW", "MEDIUM", "HIGH") and state.reasoning.root_cause:
-        logger.info("保留已有推理结论: 根因=%s, 置信度=%s", state.reasoning.root_cause, state.reasoning.confidence)
+    # 上游已给出提议时保留，避免重复推理覆盖外部结论
+    if state.reasoning.proposal is not None:
+        logger.info(
+            "保留已有归因提议: 故障模式=%s, 置信度=%s",
+            state.reasoning.proposal.failure_mode,
+            state.reasoning.proposal.confidence,
+        )
         return {}
 
     flags = set(state.data.threshold_flags or [])
-    used_inputs: list[str] = []
-    support_sources: list[str] = []
+    evidence_sources: list[EvidenceSource] = []
     conflicts: list[str] = []
 
-    # 真实判定使用了哪些输入
+    # 真实判定使用了哪些输入（与安全门禁的输入幻觉检查共用同一字段）
     if getattr(state.data.quality, "status", None) in ("OK", "PARTIAL") and (
-        state.data.threshold_flags or state.data.metrics or state.data.descriptions
+        state.data.threshold_flags or state.data.measurements or state.data.descriptions
     ):
-        used_inputs.append("data")
-        support_sources.append("DATA")
+        evidence_sources.append(EvidenceSource.DATA)
 
     if getattr(state.vision, "status", None) in ("DEFECT_FOUND", "NO_DEFECT") and state.vision.findings:
-        used_inputs.append("vision")
-        support_sources.append("VISION")
+        evidence_sources.append(EvidenceSource.VISION)
 
     if getattr(state.manual, "status", None) == "HIT" and state.manual.evidences:
-        used_inputs.append("manual")
-        support_sources.append("MANUAL")
+        evidence_sources.append(EvidenceSource.MANUAL)
 
     if getattr(state.engineer_text, "status", None) == "RECORDED" and state.engineer_text.text.strip():
-        used_inputs.append("engineer_text")
-        support_sources.append("ENGINEER_TEXT")
+        evidence_sources.append(EvidenceSource.ENGINEER_TEXT)
 
-    # 归因推导与假设生成
     hypotheses: list[Hypothesis] = []
-    root_cause = "机组运行工况综合正常"
-    confidence = "LOW"
+    failure_mode = FailureMode.NORMAL
+    confidence = Confidence.LOW
+    support_refs: list[EvidenceRef] = []
 
-    # 1. 轴承故障假设
-    bearing_crit = {"BEARING_TEMP_DE_TRIP", "BEARING_TEMP_DE_WARN", "BEARING_TEMP_DE_RAMP_SHARP", "VIB_DE_TRIP", "VIB_DE_WARN"}
+    bearing_crit = {
+        "BEARING_TEMP_DE_TRIP",
+        "BEARING_TEMP_DE_WARN",
+        "BEARING_TEMP_DE_RAMP_SHARP",
+        "VIB_DE_TRIP",
+        "VIB_DE_WARN",
+    }
     if flags.intersection(bearing_crit):
-        root_cause = "驱动端轴承干摩擦/疲劳劣化故障"
-        confidence = "HIGH" if len(support_sources) >= 2 else "MEDIUM"
-        hit_flags = flags.intersection({"BEARING_TEMP_DE_TRIP", "BEARING_TEMP_DE_WARN", "VIB_DE_TRIP"})
+        failure_mode = FailureMode.BEARING_DEGRADATION
+        confidence = Confidence.HIGH if len(evidence_sources) >= 2 else Confidence.MEDIUM
+        hit_flags = sorted(flags.intersection(bearing_crit))
+        support_refs = [_threshold_ref(code) for code in hit_flags] or [
+            _threshold_ref("BEARING_TEMP_DE_WARN")
+        ]
         hypotheses.append(
             Hypothesis(
-                cause="驱动端轴承润滑失效或疲劳剥落",
-                confidence_level="HIGH",
-                support_refs=[f"threshold:{f}" for f in hit_flags] or ["threshold:BEARING_TEMP_DE_WARN"],
+                failure_mode=FailureMode.BEARING_DEGRADATION,
+                confidence=confidence,
+                support_refs=support_refs,
                 status="SUPPORTED",
+                explanation="驱动端轴承润滑失效或疲劳剥落，温升与振动同时超过判据。",
             )
         )
-    # 2. 气蚀脱流假设
     elif flags.intersection({"PRESS_IN_TRIP", "PRESS_IN_LOW", "CV_UNSTABLE"}):
-        root_cause = "吸入管路阻力异常导致泵腔气蚀脱流"
-        confidence = "HIGH" if len(support_sources) >= 2 else "MEDIUM"
-        hit_flags = flags.intersection({"PRESS_IN_TRIP", "PRESS_IN_LOW", "CV_UNSTABLE"})
+        failure_mode = FailureMode.CAVITATION
+        confidence = Confidence.HIGH if len(evidence_sources) >= 2 else Confidence.MEDIUM
+        hit_flags = sorted(flags.intersection({"PRESS_IN_TRIP", "PRESS_IN_LOW", "CV_UNSTABLE"}))
+        support_refs = [_threshold_ref(code) for code in hit_flags]
         hypotheses.append(
             Hypothesis(
-                cause="入口吸入绝对压力不足导致介质发生汽蚀",
-                confidence_level="HIGH",
-                support_refs=[f"threshold:{f}" for f in hit_flags],
+                failure_mode=FailureMode.CAVITATION,
+                confidence=confidence,
+                support_refs=support_refs,
                 status="SUPPORTED",
+                explanation="入口吸入绝对压力不足，介质发生汽蚀与流态失稳。",
             )
         )
-    # 3. 密封泄漏假设
     elif any(f.defect_type.upper() == "LEAK" for f in state.vision.findings):
-        root_cause = "机械密封动静环摩擦副失效泄漏"
-        confidence = "HIGH"
+        failure_mode = FailureMode.SEAL_LEAK
+        confidence = Confidence.HIGH
+        leak_findings = [f for f in state.vision.findings if f.defect_type.upper() == "LEAK"]
+        support_refs = [_vision_ref(finding, idx) for idx, finding in enumerate(leak_findings)]
         hypotheses.append(
             Hypothesis(
-                cause="机械密封端面贴合失效导致连续淌漏",
-                confidence_level="HIGH",
-                support_refs=["vision:leak_finding"],
+                failure_mode=FailureMode.SEAL_LEAK,
+                confidence=confidence,
+                support_refs=support_refs,
                 status="SUPPORTED",
+                explanation="机械密封端面贴合失效导致连续淌漏。",
             )
         )
-    elif not used_inputs:
-        root_cause = "缺乏足够现场数据支持明确归因"
-        confidence = "LOW"
+    elif not evidence_sources:
+        failure_mode = FailureMode.INSUFFICIENT_EVIDENCE
+        confidence = Confidence.UNKNOWN
     else:
-        root_cause = "未见明显恶化异常，各项参数在允许波动范围内"
-        confidence = "MEDIUM"
+        failure_mode = FailureMode.NORMAL
+        confidence = Confidence.MEDIUM
 
     # 检查跨模态冲突
-    if flags.intersection({"BEARING_TEMP_DE_TRIP", "VIB_DE_TRIP"}) and getattr(state.vision, "status", None) == "NO_DEFECT":
+    if flags.intersection({"BEARING_TEMP_DE_TRIP", "VIB_DE_TRIP"}) and getattr(
+        state.vision, "status", None
+    ) == "NO_DEFECT":
         conflicts.append("SCADA 时序触发红线停机阈值，但现场拍摄图片判定无明显机械缺陷。")
 
-    reasoning_state = ReasoningState(
-        root_cause=root_cause,
-        hypotheses=hypotheses,
+    source_text = ", ".join(source.value for source in evidence_sources) or "无有效输入"
+    summary = f"综合【{source_text}】得出初步判断：{FAILURE_MODE_LABELS[failure_mode]}。"
+    if failure_mode == FailureMode.INSUFFICIENT_EVIDENCE:
+        summary = FAILURE_MODE_LABELS[FailureMode.INSUFFICIENT_EVIDENCE] + "。"
+    elif failure_mode == FailureMode.NORMAL:
+        summary = f"综合【{source_text}】，未见明显恶化异常，各项参数在允许波动范围内。"
+
+    proposal = FailureModeProposal(
+        failure_mode=failure_mode,
         confidence=confidence,
-        support_sources=support_sources,
-        summary=f"综合【{', '.join(support_sources) if support_sources else '无有效输入'}】得出初步判断：{root_cause}。",
-        insufficient_evidence=(len(used_inputs) == 0 or getattr(state.data.quality, "status", None) == "EMPTY"),
-        conflicts=conflicts,
-        used_inputs=used_inputs,
+        support_refs=support_refs,
+        explanation=summary,
     )
-    logger.info("综合归因完成: 根因=%s, 置信度=%s, 证据源=%s", root_cause, confidence, support_sources)
+    reasoning_state = ReasoningState(
+        proposal=proposal,
+        hypotheses=hypotheses,
+        evidence_sources=evidence_sources,
+        summary=summary,
+        insufficient_evidence=(
+            not evidence_sources
+            or failure_mode == FailureMode.INSUFFICIENT_EVIDENCE
+            or getattr(state.data.quality, "status", None) == "EMPTY"
+        ),
+        conflicts=conflicts,
+    )
+    logger.info(
+        "综合归因完成: 故障模式=%s, 置信度=%s, 证据源=%s",
+        failure_mode.value,
+        confidence.value,
+        source_text,
+    )
     return {"reasoning": reasoning_state}
 
 
@@ -593,6 +674,7 @@ def reasoner_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+@node_output("safety_guard")
 def safety_guard_node(state: DiagnosisState) -> dict:
     """
     Step 6：执行确定性的 RAM 风险和安全门禁卡点与分流。
@@ -610,10 +692,12 @@ def safety_guard_node(state: DiagnosisState) -> dict:
 
     safety_state = engine.evaluate(state)
     logger.info(
-        "安全门禁裁决完成: 决策=%s, 风险等级=%s, 命中规则数=%d",
-        safety_state.decision,
-        safety_state.risk_level,
-        len(safety_state.rule_hits),
+        "安全门禁裁决完成: 决策=%s, 风险等级=%s, 故障模式=%s, 规则版本=%s, 输入哈希=%s",
+        safety_state.decision.value,
+        safety_state.risk_level.value,
+        safety_state.failure_mode.value,
+        safety_state.rule_version,
+        safety_state.input_hash[:12],
     )
     if safety_state.rule_hits:
         logger.warning("安全门禁触发规则代码: %s", safety_state.rule_hits)
@@ -633,89 +717,82 @@ def safety_guard_node(state: DiagnosisState) -> dict:
 # =============================================================================
 
 
+@node_output("reporter")
 def reporter_node(state: DiagnosisState) -> dict:
-    """
-    Step 7：工单交付与分流输出节点。
-    根据 safety.decision 实施业务分流：
-    - BLOCK: 产生紧急停机指令单，阻断常规自动化派发；
-    - INSUFFICIENT_DATA: 产生现场勘验复测清单，阻断正式工单下发；
-    - MANUAL_REVIEW: 产生待人工复核工单草稿，锁定自动派发通道；
-    - PASS: 产生标准闭环排查工单，允许自动化派单。
-    """
-    import hashlib
-    from src.schemas.state import DeliveryState, EvidenceRef
+    """Step 7：基于安全门禁的已确认结论生成工单交付信息。"""
 
-    decision = getattr(state.safety, "decision", "MANUAL_REVIEW")
-    logger.info("开始生成诊断报告，当前安全决策分流=%s", decision)
+    import hashlib
+    import json
+
+    decision = state.safety.decision
+    logger.info("开始生成诊断报告，当前安全决策分流=%s", decision.value)
 
     diagnosed_at = datetime.now().replace(microsecond=0).isoformat()
-    trace_id = state.context.trace_id or "UNKNOWN_TRACE"
-    device_id = state.context.device_id or "UNKNOWN_DEVICE"
+    trace_id = state.context.trace_id
+    device_id = state.context.device_id
 
-    # 构建溯源链
+    # 构建统一证据链
     traceability: list[EvidenceRef] = []
 
-    # 1. 时序证据溯源
     for flag in state.data.threshold_flags or []:
         traceability.append(
             EvidenceRef(
-                stage="step2_data",
-                field="data.threshold_flags",
-                source_id=flag,
-                locator=f"{state.context.start_time}~{state.context.end_time}",
+                kind=EvidenceKind.THRESHOLD,
+                id=flag,
+                locator=f"data.threshold_flags @ {state.context.start_time}~{state.context.end_time}",
             )
         )
 
-    # 2. 视觉证据溯源
     for idx, finding in enumerate(state.vision.findings or []):
         traceability.append(
             EvidenceRef(
-                stage="step3_vision",
-                field="vision.findings",
-                source_id=finding.image_id or f"img_{idx}",
+                kind=EvidenceKind.VISION,
+                id=finding.image_id or f"img_{idx}",
                 locator=finding.location or "pump_body",
             )
         )
 
-    # 3. 手册证据溯源
     for ev in state.manual.evidences or []:
         traceability.append(
             EvidenceRef(
-                stage="step4_manual",
-                field="manual.evidences",
-                source_id=f"{ev.doc_id}#{ev.chunk_id}",
-                locator=f"page_{ev.page}_{ev.section}",
+                kind=EvidenceKind.MANUAL,
+                id=f"{ev.doc_id}#{ev.chunk_id}",
+                locator=f"page {ev.page} · {ev.section}",
             )
         )
 
-    # 4. 门禁证据溯源
     for rule in state.safety.rule_hits or []:
         traceability.append(
             EvidenceRef(
-                stage="step6_safety",
-                field="safety.rule_hits",
-                source_id=rule,
-                locator="rules.safety_guard",
+                kind=EvidenceKind.RULE,
+                id=rule,
+                locator="rules/safety_guard.py",
             )
         )
 
-    # 生成确定性内容哈希与交付 URI
-    content_raw = f"{trace_id}:{device_id}:{decision}:{state.safety.risk_level}:{len(traceability)}"
-    report_hash = hashlib.sha256(content_raw.encode("utf-8")).hexdigest()[:16]
+    # 工单内容哈希：覆盖已确认结论与完整证据链
+    payload = {
+        "trace_id": trace_id,
+        "device_id": device_id,
+        "verdict": state.safety.verdict.model_dump() if state.safety.verdict else None,
+        "traceability": [ref.model_dump() for ref in traceability],
+    }
+    report_sha256 = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
-    # 根据分流构建 report_uri
     dispatch_type = {
         "BLOCK": "emergency_shutdown",
         "INSUFFICIENT_DATA": "resurvey_checklist",
         "MANUAL_REVIEW": "manual_review_draft",
         "PASS": "closed_loop_order",
-    }.get(decision, "general_order")
+    }.get(decision.value, "general_order")
 
-    report_uri = f"dispatch://{dispatch_type}/{device_id}/{trace_id}?ref={report_hash}"
+    report_uri = f"dispatch://{dispatch_type}/{device_id}/{trace_id}?sha256={report_sha256}"
 
     delivery_state = DeliveryState(
         diagnosed_at=diagnosed_at,
-        report_ref=report_hash,
+        report_sha256=report_sha256,
         report_uri=report_uri,
         traceability=traceability,
     )
