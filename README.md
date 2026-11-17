@@ -2,6 +2,38 @@
 
 本项目是一个结合 **多 Agent 协同（Multi-Agent Workflow）** 与 **确定性工程安全门禁（Deterministic Guardrails）** 的工业运维智能诊断系统。系统基于 LangGraph 进行全局状态机调度，利用大语言模型完成语义提炼、视觉分析与因果假设，并通过纯确定性规则进行风险拦截与工单下发。
 
+## 可复现的离线端到端案例
+
+在项目根目录执行（使用已有依赖环境，无需数据库或 API 密钥）：
+
+```powershell
+python scripts/run_demo.py
+```
+
+脚本会在现有目录内生成合成轴承温振异常 CSV、演示规程 JSON，构造初始状态后调用
+`run_diagnosis()`。主图执行工程师文本、数据子图、无图片状态记录、本地规程检索、
+规则归因、安全门禁与交付节点；分析指标和裁决均由本次执行计算，不预填结果。
+
+- 案例输入：`data/sample_inputs/demo_bearing.csv`
+- 自制规程：`data/manuals/demo_bearing_manual.json`（仅供演示，按现有 Git 规则忽略；脚本可重建）
+- 报告：`docs/demo_diagnosis_report.md`
+- 完整状态：`docs/demo_diagnosis_report.json`
+- 演示 checkpoint：`data/demo_checkpoints.db`（独立于默认诊断库）
+
+预期结果：361 点、最高温度 85.5℃、最高振动 5.25 mm/s，安全裁决 `BLOCK / CRITICAL`。
+六项脚本验收应全部输出 PASS。每次执行创建新的 trace_id；合成采样数据保持一致。
+可用 `--output docs/other_report.md` 指定报告路径，旁边同时生成同名 JSON。
+
+此模式显式设置 `context.analysis_mode="offline"`，通过 `telemetry_uri` 指定 CSV、
+`manual_uri` 指定本地 JSON 规程。数据描述采用确定性模板；本地规程采用规则码/关键词匹配，
+`KEYWORD` 分数是匹配词覆盖率，不是向量相似度。本案例没有图片，不构造视觉结果。
+它验证离线模块连接，尚未验证 MySQL、真实 LLM、视觉模型或独立向量 RAG 的在线链路。
+原有在线入口和数据库路径保留；不提供上述本地文件路径时沿原有逻辑执行。
+
+调用方也可使用 `run_diagnosis(state, report_path="docs/report.md")` 导出自己的最终状态。
+报告明确区分逻辑 `dispatch://` 交付地址和实际报告文件，不执行设备操作或对外派单。
+测试可将 `PHM_CHECKPOINT_DB` 指向临时 SQLite 文件，以隔离默认 checkpoint 库。
+
 ---
 
 ## 1. 目录结构与各模块职责

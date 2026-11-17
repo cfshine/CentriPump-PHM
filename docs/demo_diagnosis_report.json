@@ -1,0 +1,626 @@
+{
+  "context": {
+    "trace_id": "demo-bearing-c70ddab28838",
+    "device_id": "PUMP-DEMO-BEARING-01",
+    "start_time": "2026-11-17T00:00:00",
+    "end_time": "2026-11-17T00:30:00",
+    "alarm_code": null,
+    "user_query": "合成演示：驱动端轴承逐渐发热并伴随振动升高，请排查。未提供照片。",
+    "image_refs": [],
+    "analysis_mode": "offline",
+    "telemetry_uri": "E:\\vscode\\CentriPump-PHM\\data\\sample_inputs\\demo_bearing.csv",
+    "manual_uri": "E:\\vscode\\CentriPump-PHM\\data\\manuals\\demo_bearing_manual.json"
+  },
+  "engineer_text": {
+    "status": "RECORDED",
+    "text": "合成演示：驱动端轴承逐渐发热并伴随振动升高，请排查。未提供照片。",
+    "summary": "合成演示：驱动端轴承逐渐发热并伴随振动升高，请排查。未提供照片。"
+  },
+  "data": {
+    "telemetry_ref": {
+      "source": "E:\\vscode\\CentriPump-PHM\\data\\sample_inputs\\demo_bearing.csv",
+      "trace_id": "demo-bearing-c70ddab28838",
+      "device_id": "PUMP-DEMO-BEARING-01",
+      "start_time": "2026-11-17T00:00:00",
+      "end_time": "2026-11-17T00:30:00"
+    },
+    "quality": {
+      "status": "OK",
+      "total_points": 361,
+      "reason": ""
+    },
+    "measurements": [
+      {
+        "name": "duration_sec",
+        "value": 295.0,
+        "unit": "s",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "data_points",
+        "value": 60.0,
+        "unit": "count",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "avg_flow",
+        "value": 100.0,
+        "unit": "m³/h",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "avg_press_out",
+        "value": 0.312,
+        "unit": "MPa",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "avg_press_in",
+        "value": 0.02,
+        "unit": "MPa",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "cv_flow",
+        "value": 0.36,
+        "unit": "%",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "cv_press",
+        "value": 0.0,
+        "unit": "%",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "slope_temp_de",
+        "value": 0.0,
+        "unit": "℃/min",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "max_temp_de",
+        "value": 48.0,
+        "unit": "℃",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "max_temp_nde",
+        "value": 45.0,
+        "unit": "℃",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "slope_vib_de",
+        "value": 0.0,
+        "unit": "mm/s/min",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "max_vib_de",
+        "value": 1.5,
+        "unit": "mm/s",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "max_vib_nde",
+        "value": 1.4,
+        "unit": "mm/s",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "avg_motor_current",
+        "value": 22.5,
+        "unit": "A",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "max_motor_current",
+        "value": 22.5,
+        "unit": "A",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "cv_flow_peak",
+        "value": 0.31,
+        "unit": "%",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "cv_press_peak",
+        "value": 0.0,
+        "unit": "%",
+        "segment": "phase:0",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55"
+      },
+      {
+        "name": "duration_sec",
+        "value": 1500.0,
+        "unit": "s",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "data_points",
+        "value": 301.0,
+        "unit": "count",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "avg_flow",
+        "value": 100.02,
+        "unit": "m³/h",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "avg_press_out",
+        "value": 0.312,
+        "unit": "MPa",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "avg_press_in",
+        "value": 0.02,
+        "unit": "MPa",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "cv_flow",
+        "value": 0.35,
+        "unit": "%",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "cv_press",
+        "value": 0.0,
+        "unit": "%",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "slope_temp_de",
+        "value": 1.5,
+        "unit": "℃/min",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_temp_de",
+        "value": 85.5,
+        "unit": "℃",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_temp_nde",
+        "value": 45.0,
+        "unit": "℃",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "slope_vib_de",
+        "value": 0.15,
+        "unit": "mm/s/min",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_vib_de",
+        "value": 5.25,
+        "unit": "mm/s",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_vib_nde",
+        "value": 1.4,
+        "unit": "mm/s",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "avg_motor_current",
+        "value": 22.5,
+        "unit": "A",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_motor_current",
+        "value": 22.5,
+        "unit": "A",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "cv_flow_peak",
+        "value": 0.31,
+        "unit": "%",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "cv_press_peak",
+        "value": 0.0,
+        "unit": "%",
+        "segment": "phase:1",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "total_points",
+        "value": 361.0,
+        "unit": "count",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "phase_count",
+        "value": 2.0,
+        "unit": "count",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_temp_de",
+        "value": 85.5,
+        "unit": "℃",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_vib_de",
+        "value": 5.25,
+        "unit": "mm/s",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_temp_nde",
+        "value": 45.0,
+        "unit": "℃",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "max_vib_nde",
+        "value": 1.4,
+        "unit": "mm/s",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "avg_flow",
+        "value": 100.01494182825485,
+        "unit": "m³/h",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      },
+      {
+        "name": "min_press_in",
+        "value": 0.02,
+        "unit": "MPa",
+        "segment": "overall",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:30:00"
+      }
+    ],
+    "segments": [
+      {
+        "index": 0,
+        "state": "NORMAL",
+        "start_time": "2026-11-17T00:00:00",
+        "end_time": "2026-11-17T00:04:55",
+        "duration_sec": 295,
+        "data_points": 60,
+        "rule_hits": [],
+        "ramp_start_time": null
+      },
+      {
+        "index": 1,
+        "state": "DEGRADING",
+        "start_time": "2026-11-17T00:05:00",
+        "end_time": "2026-11-17T00:30:00",
+        "duration_sec": 1500,
+        "data_points": 301,
+        "rule_hits": [
+          "BEARING_TEMP_DE_TRIP",
+          "BEARING_TEMP_DE_RAMP_SHARP",
+          "VIB_DE_TRIP",
+          "VIB_DE_DOMINANT"
+        ],
+        "ramp_start_time": "2026-11-17T00:05:55"
+      }
+    ],
+    "threshold_flags": [
+      "BEARING_TEMP_DE_TRIP",
+      "BEARING_TEMP_DE_RAMP_SHARP",
+      "VIB_DE_TRIP",
+      "VIB_DE_DOMINANT"
+    ],
+    "alarms": {
+      "effective": [
+        "TAHH-101"
+      ],
+      "last": [
+        "TAHH-101"
+      ],
+      "all": [
+        "TAHH-101"
+      ]
+    },
+    "descriptions": [
+      {
+        "kind": "THRESHOLD",
+        "description": "离线规则计算命中 BEARING_TEMP_DE_TRIP；未调用语言模型。",
+        "evidence": [
+          "BEARING_TEMP_DE_TRIP"
+        ]
+      },
+      {
+        "kind": "THRESHOLD",
+        "description": "离线规则计算命中 BEARING_TEMP_DE_RAMP_SHARP；未调用语言模型。",
+        "evidence": [
+          "BEARING_TEMP_DE_RAMP_SHARP"
+        ]
+      },
+      {
+        "kind": "THRESHOLD",
+        "description": "离线规则计算命中 VIB_DE_TRIP；未调用语言模型。",
+        "evidence": [
+          "VIB_DE_TRIP"
+        ]
+      },
+      {
+        "kind": "THRESHOLD",
+        "description": "离线规则计算命中 VIB_DE_DOMINANT；未调用语言模型。",
+        "evidence": [
+          "VIB_DE_DOMINANT"
+        ]
+      }
+    ]
+  },
+  "vision": {
+    "status": "NO_IMAGE",
+    "findings": [],
+    "summary": "无图片：未提供现场图片，跳过视觉分析"
+  },
+  "manual": {
+    "status": "HIT",
+    "evidences": [
+      {
+        "doc_id": "DEMO-BEARING-MANUAL",
+        "chunk_id": "bearing-01",
+        "section": "1. 驱动端轴承温振异常（演示资料）",
+        "page": 0,
+        "quote": "演示案例采用项目 rules/thresholds.py 的判据：驱动端轴承温度达到80℃或振动达到4.5mm/s触发停机线。温振同步恶化时应优先核验轴承及润滑系统，具体根因须检查确认。",
+        "score": 0.6,
+        "channel": "KEYWORD"
+      }
+    ],
+    "mechanism": "轴承与润滑异常可伴随驱动端温度、振动同步升高；仅凭时序数据无法确认具体损伤形态。",
+    "requirements": [
+      {
+        "requirement": "达到停机线时应按现场审批规程隔离设备，禁止带故障继续运行。",
+        "source_ref": {
+          "kind": "MANUAL",
+          "id": "DEMO-BEARING-MANUAL#bearing-01",
+          "locator": "E:\\vscode\\CentriPump-PHM\\data\\manuals\\demo_bearing_manual.json · 1. 驱动端轴承温振异常（演示资料）"
+        }
+      }
+    ],
+    "actions": [
+      {
+        "action": "【安全门禁最高级指令】立即执行紧急切机停运操作！禁止带病维持运转，防范轴承烧死或介质爆炸事故！",
+        "priority": "HIGH",
+        "source_ref": {
+          "kind": "RULE",
+          "id": "CRITICAL_BLOCK",
+          "locator": "rules/safety_guard.py"
+        }
+      },
+      {
+        "action": "切断机泵主电源并实施安全挂牌上锁 (LOTO)，通知工艺管网值班长启动备用机泵切换。",
+        "priority": "HIGH",
+        "source_ref": {
+          "kind": "RULE",
+          "id": "LOTO_PROCEDURE",
+          "locator": "rules/safety_guard.py"
+        }
+      }
+    ]
+  },
+  "reasoning": {
+    "proposal": {
+      "failure_mode": "BEARING_DEGRADATION",
+      "confidence": "HIGH",
+      "support_refs": [
+        {
+          "kind": "THRESHOLD",
+          "id": "BEARING_TEMP_DE_RAMP_SHARP",
+          "locator": "rules/thresholds.py"
+        },
+        {
+          "kind": "THRESHOLD",
+          "id": "BEARING_TEMP_DE_TRIP",
+          "locator": "rules/thresholds.py"
+        },
+        {
+          "kind": "THRESHOLD",
+          "id": "VIB_DE_TRIP",
+          "locator": "rules/thresholds.py"
+        }
+      ],
+      "explanation": "综合【DATA, MANUAL, ENGINEER_TEXT】得出初步判断：驱动端轴承干摩擦或疲劳劣化。"
+    },
+    "hypotheses": [
+      {
+        "failure_mode": "BEARING_DEGRADATION",
+        "confidence": "HIGH",
+        "support_refs": [
+          {
+            "kind": "THRESHOLD",
+            "id": "BEARING_TEMP_DE_RAMP_SHARP",
+            "locator": "rules/thresholds.py"
+          },
+          {
+            "kind": "THRESHOLD",
+            "id": "BEARING_TEMP_DE_TRIP",
+            "locator": "rules/thresholds.py"
+          },
+          {
+            "kind": "THRESHOLD",
+            "id": "VIB_DE_TRIP",
+            "locator": "rules/thresholds.py"
+          }
+        ],
+        "contradicting_refs": [],
+        "status": "SUPPORTED",
+        "explanation": "驱动端轴承润滑失效或疲劳剥落，温升与振动同时超过判据。"
+      }
+    ],
+    "evidence_sources": [
+      "DATA",
+      "MANUAL",
+      "ENGINEER_TEXT"
+    ],
+    "summary": "综合【DATA, MANUAL, ENGINEER_TEXT】得出初步判断：驱动端轴承干摩擦或疲劳劣化。",
+    "insufficient_evidence": false,
+    "conflicts": []
+  },
+  "safety": {
+    "verdict": {
+      "decision": "BLOCK",
+      "risk_level": "CRITICAL",
+      "failure_mode": "BEARING_DEGRADATION",
+      "rule_hits": [
+        "BEARING_TEMP_DE_RAMP_SHARP",
+        "BEARING_TEMP_DE_TRIP",
+        "VIB_DE_TRIP"
+      ],
+      "reasons": [
+        "触发紧急停机线/急剧恶化判据【BEARING_TEMP_DE_RAMP_SHARP】: 驱动端温度急剧恶化 (依据: 规范 5.2)。",
+        "触发紧急停机线/急剧恶化判据【BEARING_TEMP_DE_TRIP】: 驱动端温度超停机线 (依据: GB 50275-2010 / 规范第三节)。",
+        "触发紧急停机线/急剧恶化判据【VIB_DE_TRIP】: 驱动端振动超国标停机线 (依据: GB 50275 附录 A)。"
+      ],
+      "rule_version": "1.0.0",
+      "input_hash": "9c9742a3bfa293181f82bedf5d077d63beb69602ca3f347d9d49b0078f5834ef"
+    }
+  },
+  "human": {
+    "reviews": []
+  },
+  "delivery": {
+    "diagnosed_at": "2026-11-17T11:18:56",
+    "report_sha256": "cfb4b50cb58e9632a5c19db3200cf7a4cff8b509296f3b45b99756ee570059c8",
+    "report_uri": "dispatch://emergency_shutdown/PUMP-DEMO-BEARING-01/demo-bearing-c70ddab28838?sha256=cfb4b50cb58e9632a5c19db3200cf7a4cff8b509296f3b45b99756ee570059c8",
+    "traceability": [
+      {
+        "kind": "THRESHOLD",
+        "id": "BEARING_TEMP_DE_TRIP",
+        "locator": "data.threshold_flags @ 2026-11-17T00:00:00~2026-11-17T00:30:00"
+      },
+      {
+        "kind": "THRESHOLD",
+        "id": "BEARING_TEMP_DE_RAMP_SHARP",
+        "locator": "data.threshold_flags @ 2026-11-17T00:00:00~2026-11-17T00:30:00"
+      },
+      {
+        "kind": "THRESHOLD",
+        "id": "VIB_DE_TRIP",
+        "locator": "data.threshold_flags @ 2026-11-17T00:00:00~2026-11-17T00:30:00"
+      },
+      {
+        "kind": "THRESHOLD",
+        "id": "VIB_DE_DOMINANT",
+        "locator": "data.threshold_flags @ 2026-11-17T00:00:00~2026-11-17T00:30:00"
+      },
+      {
+        "kind": "MANUAL",
+        "id": "DEMO-BEARING-MANUAL#bearing-01",
+        "locator": "page 0 · 1. 驱动端轴承温振异常（演示资料）"
+      },
+      {
+        "kind": "RULE",
+        "id": "BEARING_TEMP_DE_RAMP_SHARP",
+        "locator": "rules/safety_guard.py"
+      },
+      {
+        "kind": "RULE",
+        "id": "BEARING_TEMP_DE_TRIP",
+        "locator": "rules/safety_guard.py"
+      },
+      {
+        "kind": "RULE",
+        "id": "VIB_DE_TRIP",
+        "locator": "rules/safety_guard.py"
+      }
+    ]
+  },
+  "workflow": {
+    "schema_version": "2.0",
+    "degraded_steps": []
+  }
+}

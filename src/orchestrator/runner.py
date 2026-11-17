@@ -15,7 +15,8 @@ from src.schemas.state import DiagnosisState
 logger = get_logger(__name__)
 
 
-def run_diagnosis(state: DiagnosisState, *, trace_id: str | None = None) -> Any:
+def run_diagnosis(state: DiagnosisState, *, trace_id: str | None = None,
+                  report_path: str | None = None) -> Any:
     """运行一次诊断，默认令 LangGraph thread_id 与 trace_id 相同。"""
 
     resolved_trace_id = trace_id or state.context.trace_id
@@ -37,5 +38,8 @@ def run_diagnosis(state: DiagnosisState, *, trace_id: str | None = None) -> Any:
         except Exception:
             logger.exception("诊断任务失败")
             raise
+        if report_path:
+            from src.schemas.report import write_diagnosis_report
+            write_diagnosis_report(DiagnosisState.model_validate(result), report_path)
         logger.info("诊断任务完成")
         return result

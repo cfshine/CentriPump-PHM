@@ -7,6 +7,7 @@
   · 提示词           → configs/prompts/data_agent.yaml
 """
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 import pandas as pd
@@ -35,8 +36,7 @@ from src.sub_agents.data_agent.timeseries_tools import (
     _py,
     render_rule_hits,
 )
-from src.utils.config_loader import PROJECT_PATH
-from src.utils.llm_client import model
+PROJECT_PATH = Path(__file__).resolve().parents[3]
 
 #: 提示词模板路径（与代码解耦，改提示词不用动 Python）
 PROMPT_PATH = PROJECT_PATH / "configs" / "prompts" / "data_agent.yaml"
@@ -299,7 +299,7 @@ def analyze_node(state: DiagnosisState) -> dict:
     """
     ctx = state.context
     telemetry_ref = TelemetryRef(
-        source="scada_db.scada_telemetry",
+        source=ctx.telemetry_uri or "scada_db.scada_telemetry",
         trace_id=ctx.trace_id,
         device_id=ctx.device_id,
         start_time=ctx.start_time,
@@ -316,8 +316,12 @@ def analyze_node(state: DiagnosisState) -> dict:
             threshold_flags=[], alarms=AlarmState(),
         )
 
+    if ctx.analysis_mode == "offline" and not ctx.telemetry_uri:
+        raise ValueError("离线时序分析必须显式提供 telemetry_uri CSV 路径")
+
     print(f"[analyze] 拉取 {ctx.device_id} 在 {ctx.start_time} ~ {ctx.end_time} 的数据")
-    raw = query_scada_telemetry(ctx.device_id, ctx.start_time, ctx.end_time)
+    raw = query_scada_telemetry(ctx.device_id, ctx.start_time, ctx.end_time,
+                               csv_path=ctx.telemetry_uri)
     print(f"[analyze] 获取到 {len(raw)} 条记录")
 
     df = pd.DataFrame(raw)
@@ -408,6 +412,16 @@ def summarize_node(state: DiagnosisState) -> dict:
         print(f"[summarize] 数据质量 {data.quality.status} → 跳过语义化（不调用大模型）")
         return {}
 
+    if ctx.analysis_mode == "offline":
+        descriptions = [DataDescription(
+            kind="THRESHOLD",
+            description=f"离线规则计算命中 {code}；未调用语言模型。",
+            evidence=[code],
+        ) for code in data.threshold_flags]
+        if not descriptions:
+            descriptions = [DataDescription(kind="OTHER", description="离线规则计算未命中阈值；未调用语言模型。")]
+        return _data_update(state, descriptions=descriptions)
+
     phases = _phase_views(data)
     overall = _overall_view(data, ctx)
 
@@ -415,6 +429,7 @@ def summarize_node(state: DiagnosisState) -> dict:
     rule_hits_text = render_rule_hits(phases)
 
     prompt = _load_prompt_template()
+    from src.utils.llm_client import model
     chain = prompt | model.with_structured_output(SemanticizeOutput)
 
     result: SemanticizeOutput = chain.invoke({

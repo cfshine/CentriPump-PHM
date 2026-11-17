@@ -197,9 +197,9 @@ def data_node(state: DiagnosisState) -> dict:
             end_time=end_time,
         )
         quality = DataQuality(
-            status="EMPTY",
+            status="FAILED",
             total_points=0,
-            reason=f"时序数据处理异常降级: {type(exc).__name__}",
+            reason=f"时序数据处理异常: {type(exc).__name__}",
         )
         return {
             "data": DataState(
@@ -324,6 +324,10 @@ def manual_node(state: DiagnosisState) -> dict:
     Step 4：手册 / RAG 知识检索节点（当前阶段由高拟真硬编码规程引擎支撑）。
     基于设备类型、时序告警码、阈值特征与视觉缺陷，检索对应的《离心泵使用维护说明书》(IOM)及国标条款。
     """
+
+    if state.context.manual_uri:
+        from src.sub_agents.manual_agent import retrieve_local_manual
+        return {"manual": retrieve_local_manual(state)}
 
     logger.info("开始检索维修手册与工程规程 (硬编码RAG模块)")
     flags = set(state.data.threshold_flags or [])

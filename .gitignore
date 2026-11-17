@@ -30,6 +30,7 @@ htmlcov/
 # ---- 运行产物 ----
 *.log
 test_run*.log
+/data/demo_checkpoints.db
 
 # OS
 .DS_Store

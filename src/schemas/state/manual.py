@@ -18,7 +18,7 @@ class ManualEvidence(StateModel):
     page: int = 0
     quote: str = ""
     score: float = 0.0
-    channel: Literal["DENSE", "BM25", "HYBRID"] = "HYBRID"
+    channel: Literal["DENSE", "BM25", "HYBRID", "KEYWORD"] = "HYBRID"
 
 
 class ProcedureRequirement(StateModel):

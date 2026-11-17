@@ -174,6 +174,7 @@ Graph 职责边界
 """
 
 from pathlib import Path
+import os
 import sqlite3
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -205,7 +206,7 @@ from src.schemas.state import DiagnosisState
 #     E:/.../data/checkpoints/checkpoints.db
 #
 # 当前使用相对路径，便于开发阶段运行。
-CHECKPOINT_DB = Path("data/checkpoints.db")
+CHECKPOINT_DB = Path(os.getenv("PHM_CHECKPOINT_DB", "data/checkpoints.db"))
 
 def build_diagnosis_graph():
     """

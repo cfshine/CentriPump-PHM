@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from .common import StateModel
@@ -33,6 +35,9 @@ class ContextState(StateModel):
     user_query: str = ""
 
     image_refs: list[ImageRef] = Field(default_factory=list)
+    analysis_mode: Literal["online", "offline"] = "online"
+    telemetry_uri: str = ""
+    manual_uri: str = ""
 
 
 __all__ = ["ContextState", "ImageRef"]

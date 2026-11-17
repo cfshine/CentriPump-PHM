@@ -201,6 +201,9 @@ class SafetyGuardEngine:
         rule_hits: list[str] = []
 
         # 检查空输入 (完全信息真空)
+        if state.data.quality.status == "FAILED" or state.vision.status == "FAILED":
+            return True, ["证据采集或分析失败，须修复失败环节并重新采集，禁止自动放行。"], ["RULE_EVIDENCE_FAILURE_GUARD"]
+
         data_empty = (
             state.data.quality.status in ("EMPTY", "PENDING")
             and not state.data.threshold_flags

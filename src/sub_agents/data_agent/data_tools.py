@@ -4,10 +4,6 @@
 # =============================================================================
 from datetime import datetime
 
-from src.utils.database import get_db_session
-
-from .repository import ScadaTelemetry
-
 
 def _parse_ts(ts: str) -> datetime:
     """把 Step 1 传来的 ISO 字符串解析为 naive datetime。
@@ -21,7 +17,7 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", ""))
 
 
-def query_scada_telemetry(device_id: str, start_time: str, end_time: str) -> list:
+def query_scada_telemetry(device_id: str, start_time: str, end_time: str, *, csv_path: str = "") -> list:
     """按设备 + 时间窗口（闭区间）查询 SCADA 时序数据。
 
     参数：
@@ -34,6 +30,29 @@ def query_scada_telemetry(device_id: str, start_time: str, end_time: str) -> lis
         窗口内无数据时返回空列表（不抛异常）。
     """
     start_dt, end_dt = _parse_ts(start_time), _parse_ts(end_time)
+
+    if csv_path:
+        import numpy as np
+        import pandas as pd
+
+        df = pd.read_csv(csv_path, keep_default_na=False)
+        required = {"device_id", "timestamp", "flow_rate", "press_out", "press_in",
+                    "temp_de", "temp_nde", "vib_rms_de", "vib_rms_nde",
+                    "motor_current", "operating_state", "alarm_code"}
+        if missing := required - set(df.columns):
+            raise ValueError(f"CSV 缺少字段: {sorted(missing)}")
+        times = pd.to_datetime(df["timestamp"], errors="raise")
+        df = df.loc[(df.device_id == device_id) & times.between(start_dt, end_dt)].copy()
+        numeric = sorted(required - {"device_id", "timestamp", "operating_state", "alarm_code"})
+        df[numeric] = df[numeric].apply(pd.to_numeric, errors="raise")
+        if not np.isfinite(df[numeric].to_numpy(dtype=float)).all():
+            raise ValueError("CSV 测点存在空值或非有限数值")
+        if df["timestamp"].duplicated().any():
+            raise ValueError("CSV 同设备时间戳重复")
+        return df.sort_values("timestamp").to_dict("records")
+
+    from src.utils.database import get_db_session
+    from .repository import ScadaTelemetry
 
     with get_db_session() as db:
         records = db.query(ScadaTelemetry).filter(
