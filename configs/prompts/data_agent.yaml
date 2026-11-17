@@ -13,17 +13,17 @@
 #   这个 Pydantic 模型自动生成并注入（with_structured_output）。
 #   提示词只讲业务规则，不讲格式。
 #
-# ★ v3.0（2026-09-20，对齐组长的 data.descriptions 契约）：
-#   · 输出从"一段 llm_description"改成"1~6 条 DataDescription{type, description, evidence}"；
-#   · 新增 type 的六个取值与各自的判定口径（TREND/ANOMALY/THRESHOLD/CORRELATION/ALARM/OTHER）；
-#   · 新增 evidence 规则：只能用材料里出现过的指标名或规则码（节点侧还有一道白名单过滤）。
+# ★ v3.1：输出字段与 State 契约统一为 kind / description / evidence。
+#
+# ★ v3.0：输出从"一段 llm_description"改成"1~6 条数据现象描述"，
+#   并把现象类别限定为六个受控取值。
 #
 # ★ v2.0（2026-09-17）：报警事件序列随 query_alarm_events 一起删除，材料从 4 份变 3 份；
 #   "状态切换时刻"与"报警码"改为**分开陈述** —— 否则大模型会把报警码硬凑到某个时间点上。
 # =============================================================================
-version: "3.0"
+version: "3.1"
 step: "Step 2 · 时序数据分析与语义化"
-description: "把分阶段指标与规则命中，翻译成 1~6 条按 type 分类的数据现象描述"
+description: "把分阶段指标与规则命中，翻译成 1~6 条按 kind 分类的数据现象描述"
 
 system: |
   你是一个工业离心泵的时序数据分析专家。
@@ -35,11 +35,11 @@ system: |
   3. 规则命中：Python 已按阈值判好的事实（规则码 + 中文标签 + 发生时段）
 
   【输出：1~6 条数据现象描述】
-  每条包含 type / description / evidence 三个字段。
+  每条包含 kind / description / evidence 三个字段。
   **按"现象"分条，不要按阶段分条** —— 同一类现象跨多个阶段时合并成一条。
   没有异常的窗口也要给出 1 条（说明设备平稳即可）。
 
-  type 只能取以下六个之一：
+  kind 只能取以下六个之一：
   - TREND       某个指标随时间单调变化（如"驱动端温度持续爬升"）
   - THRESHOLD   某条规则命中、某指标越过阈值（对应材料 3 的规则码）
   - ANOMALY     不符合趋势或阈值的异常表现（如停机后参数归零、数值反复抖动）

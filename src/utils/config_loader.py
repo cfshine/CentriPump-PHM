@@ -23,10 +23,14 @@ def find_project_root(start: Path | None = None) -> Path:
     return here.parents[2]
 
 
+from dotenv import load_dotenv
+
 #工程路径
 PROJECT_PATH = find_project_root()
 #环境路径
 ENV_PATH = PROJECT_PATH / '.env'
+if ENV_PATH.is_file():
+    load_dotenv(ENV_PATH)
 
 class Setting(BaseSettings):
     #1、数据库配置
@@ -50,7 +54,7 @@ class Setting(BaseSettings):
 
 
     #本地开发环境加载.env环境配置信息
-    model_config = SettingsConfigDict(env_file=ENV_PATH, env_file_encoding='utf-8')
+    model_config = SettingsConfigDict(env_file=ENV_PATH, env_file_encoding='utf-8', extra='ignore')
     #线上环境加载环境变量直接通过os.environ获取系统环境变量，保证配置信息安全
     #数据库连接URL
     def get_database_url(self):

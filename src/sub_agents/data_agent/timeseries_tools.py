@@ -73,23 +73,20 @@ def _is_valid_alarm(code) -> bool:
     return isinstance(code, str) and code.strip() not in ("", "NONE", "None", "null")
 
 
-def _extract_alarm_codes(df: pd.DataFrame) -> tuple[str, str, list[str]]:
+def _extract_alarm_codes(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
     """从窗口内的帧里提取报警码，返回三元组 ``(effective, last, all)``。
 
     参数：
         df: 原始遥测 DataFrame，必须含 ``alarm_code`` 列
-            （多码以分号连接，无报警为 ``NONE``）。
+            （多码以分号连接，无报警为空或 ``NONE``，由本函数过滤）。
 
     返回：
-        ``effective``: 窗口内出现过的报警码去重排序（";" 连接）；无则 ``"NONE"``
-        ``last``:      窗口内**最后一次**非 NONE 的报警码组合；无则 ``"NONE"``
-        ``all``:       去重后的列表形式；无则 ``[]``
+        全部为 ``list[str]``；缺失即空列表，不再使用 ``"NONE"`` 哨兵。
     """
     valid_rows = df[df['alarm_code'].apply(_is_valid_alarm)]
     if valid_rows.empty:
-        return "NONE", "NONE", []
+        return [], [], []
 
-    # 收集窗口内出现过的所有报警码
     all_codes = set()
     for codes_str in valid_rows['alarm_code']:
         for code in codes_str.split(";"):
@@ -98,9 +95,12 @@ def _extract_alarm_codes(df: pd.DataFrame) -> tuple[str, str, list[str]]:
                 all_codes.add(code)
     all_list = sorted(all_codes)
 
-    effective = ";".join(all_list) if all_list else "NONE"
-    last = valid_rows['alarm_code'].iloc[-1].strip()
-    return effective, last, all_list
+    last = [
+        code.strip()
+        for code in str(valid_rows['alarm_code'].iloc[-1]).split(";")
+        if code.strip() and code.strip() not in ("NONE", "None", "null")
+    ]
+    return all_list, last, all_list
 
 
 def _detect_ramp_start(seg: pd.DataFrame) -> dict:
@@ -206,7 +206,7 @@ def _format_overall(overall: dict) -> str:
         f"- 结束状态：{overall.get('end_state', 'UNKNOWN')}\n"
         f"- 是否发生停机：{overall.get('has_shutdown', False)}\n"
         f"- 阶段数：{overall.get('phase_count', 0)}\n"
-        f"- 窗口内出现过的报警码：{overall.get('effective_alarm_codes', 'NONE')}\n"
-        f"- 全程最高温度(驱动端)：{overall.get('max_temp_de_overall', '?')} ℃\n"
-        f"- 全程最高振动(驱动端)：{overall.get('max_vib_de_overall', '?')} mm/s"
+        f"- 窗口内出现过的报警码：{overall.get('effective_alarm_codes') or '无'}\n"
+        f"- 全程最高温度(驱动端)：{overall.get('max_temp_de', '?')} ℃\n"
+        f"- 全程最高振动(驱动端)：{overall.get('max_vib_de', '?')} mm/s"
     )

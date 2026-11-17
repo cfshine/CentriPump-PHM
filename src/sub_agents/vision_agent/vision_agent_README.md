@@ -47,7 +47,7 @@
 | `ocr_quality.py` | 131 | **工具层**：判 OCR 文本是"噪声"还是"有用"（纯函数） |
 
 > ★ `vision_models.py` 是 **Step 3 内部**的数据模型，**不属于主图公共契约**
-> （公共契约在 `src/schemas/state.py`）。它同时充当视觉大模型的输出 schema。
+> （公共契约在 `src/schemas/state/`）。它同时充当视觉大模型的输出 schema。
 
 ---
 
